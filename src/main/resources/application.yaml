@@ -1,0 +1,45 @@
+# 该配置为反向连接示例
+server:
+  port: 2233
+
+shiro:
+  ws:
+    server:
+      enable: false
+      url: "/ws/demo"
+    client:
+      enable: true
+      url: "ws://127.0.0.1:3001"
+  plugin-list:
+
+bot:
+  qq: 0
+  admin: 0
+spring:
+  datasource:
+    type: com.alibaba.druid.pool.DruidDataSource
+
+    dynamic:
+      primary: sqlite
+      datasource:
+        sqlite:
+          url: jdbc:sqlite:resources/xatiiBot.db
+          driver-class-name: org.sqlite.JDBC
+        mysql:
+          url: jdbc:mysql:///xatiiBot
+          username: root
+          password: 152773652
+          driver-class-name: com.mysql.cj.jdbc.Driver
+
+mybatis-plus:
+  type-aliases-package: com.esdllm.model
+  global-config:
+    db-config:
+      logic-delete-field: isDelete  #全局逻辑删除
+      logic-delete-value: 1 # 逻辑已删除值
+      logic-not-delete-value: 0 # 逻辑未删除值
+      table-prefix:  # 设置表的前缀
+  configuration:
+    map-underscore-to-camel-case: true #开启驼峰命名
+  type-handlers-package: com.esdllm.config
+
