@@ -2,7 +2,6 @@ package com.esdllm.config;
 
 import org.apache.ibatis.type.BaseTypeHandler;
 import org.apache.ibatis.type.JdbcType;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.sql.CallableStatement;
@@ -43,12 +42,12 @@ public class CustomDateTypeHandler extends BaseTypeHandler<List<Long>> {
 
 
     @Override
-    public List<Long> getNullableResult(ResultSet rs, int columnIndex) throws SQLException {
+    public List<Long> getNullableResult(ResultSet rs, int columnIndex) {
         return List.of(0L);
     }
 
     @Override
-    public List<Long> getNullableResult(CallableStatement cs, int columnIndex) throws SQLException {
+    public List<Long> getNullableResult(CallableStatement cs, int columnIndex) {
         return List.of(0L);
     }
 }

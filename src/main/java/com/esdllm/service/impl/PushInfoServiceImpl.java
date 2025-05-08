@@ -6,7 +6,6 @@ import com.esdllm.bilibiliApi.bilibiliApi.BilibiliClient;
 import com.esdllm.bilibiliApi.bilibiliApi.CardInfo;
 import com.esdllm.bilibiliApi.bilibiliApi.Dynamic;
 import com.esdllm.bilibiliApi.bilibiliApi.Live;
-import com.esdllm.bilibiliApi.model.data.pojo.LiveRoom;
 import com.esdllm.model.Admin;
 import com.esdllm.model.PushInfo;
 import com.esdllm.model.respObj.PushInfoResp;
@@ -153,7 +152,7 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
                         continue;
                     }
                     String message = buildMessage(bot, pushInfo, liveRoom, cardInfo);
-                    updatePushInfoStatus(pushInfo, liveRoom);
+                    updatePushInfoStatus(pushInfo);
                     sendMessage(bot, pushInfo, message);
                     continue;
                 }
@@ -162,7 +161,7 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
                     String sendMsg = buildMessage(bot, pushInfo, liveRoom, cardInfo);
 
                     // 更新推送信息状态
-                    updatePushInfoStatus(pushInfo, liveRoom);
+                    updatePushInfoStatus(pushInfo);
 
                     // 发送消息
                     sendMessage(bot, pushInfo, sendMsg);
@@ -297,7 +296,7 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
         }
         // 下播消息
         else {
-            return buildLiveEndMessage(pushInfo, userName, uid);
+            return buildLiveEndMessage(pushInfo, userName);
         }
     }
 
@@ -341,7 +340,7 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
             msgBuilder.append(MsgUtils.builder().at(aLong).build());
         }
 
-        return msgBuilder.toString() + MsgUtils.builder().text(" " +
+        return msgBuilder + MsgUtils.builder().text(" " +
                         userName + " 开播了" +
                         "\n标题：" + liveRoom.getLiveTitle(roomId) + "\n" +
                         "分区：" + liveRoom.getLiveArea(roomId) + "\n" +
@@ -366,7 +365,7 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
     /**
      * 构建下播消息
      */
-    private String buildLiveEndMessage(PushInfo pushInfo, String userName, Long uid) {
+    private String buildLiveEndMessage(PushInfo pushInfo, String userName) {
         Date now = new Date();
         long between = now.getTime() - pushInfo.getLiveTime();
         long hour = (between / (60 * 60 * 1000));
@@ -392,7 +391,7 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
     /**
      * 更新推送信息状态
      */
-    private void updatePushInfoStatus(PushInfo pushInfo, Live liveRoom) {
+    private void updatePushInfoStatus(PushInfo pushInfo) {
         // 切换直播状态
         pushInfo.setLiveStatus(pushInfo.getLiveStatus().equals(0) ? 1 : 0);
         pushInfo.setUpdateTime(null);

@@ -47,8 +47,6 @@ public class BiliBiliPushPlugins {
 
             String[] split = message.split(" ");
             long roomId;
-            Long qqUid = event.getUserId();
-            Long groupId = event.getGroupId();
 
             try {
                 roomId = Long.parseLong(split[0]);
@@ -84,8 +82,6 @@ public class BiliBiliPushPlugins {
     public void delPush(Bot bot, AnyMessageEvent event) {
         try {
             String message = parseMessage(event.getMessage());
-            Long qqUid = event.getUserId();
-            Long groupId = event.getGroupId();
 
             if (message.isEmpty()) {
                 boolean del = pushInfoService.pushDel(event);
