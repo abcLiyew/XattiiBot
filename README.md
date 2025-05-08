@@ -82,6 +82,6 @@ XatiiBot 是一个基于 Java 开发的 QQ 机器人，主要用于解析和分�
 https://github.com/abcLiyew/BiliBili-API
 
 ## 开发者
-- LiYehe ：项目主要开发者
+- 饿死的流浪猫 ：项目主要开发者
 ## 许可证
 请参阅项目中的 LICENSE 文件了解详情。
