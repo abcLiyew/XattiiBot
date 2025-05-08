@@ -106,7 +106,7 @@ public class SignInPlugins {
     public void query(Bot bot, AnyMessageEvent event) {
         Long groupId = event.getGroupId();
         Long qqUid = event.getUserId();
-        LambdaQueryWrapper<SignInRecords> queryWrapper = new LambdaQueryWrapper<SignInRecords>();
+        LambdaQueryWrapper<SignInRecords> queryWrapper = new LambdaQueryWrapper<>();
         queryWrapper.eq(SignInRecords::getQqUid,qqUid);
         if (!Objects.isNull(groupId)){
             queryWrapper.eq(SignInRecords::getGroupId,groupId);

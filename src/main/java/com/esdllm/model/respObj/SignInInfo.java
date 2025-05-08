@@ -3,8 +3,6 @@ package com.esdllm.model.respObj;
 import com.esdllm.common.SignLevel;
 import lombok.Data;
 
-import java.util.Date;
-
 @Data
 public class SignInInfo{
     Boolean isSign; // 是否签到成功

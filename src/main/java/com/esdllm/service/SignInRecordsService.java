@@ -1,10 +1,8 @@
 package com.esdllm.service;
 
-import com.esdllm.common.SignLevel;
 import com.esdllm.model.SignInRecords;
 import com.baomidou.mybatisplus.extension.service.IService;
 import com.esdllm.model.respObj.SignInInfo;
-import lombok.Data;
 
 /**
 * @author LiYehe
