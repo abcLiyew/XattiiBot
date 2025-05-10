@@ -33,7 +33,7 @@
         <dependency>
             <groupId>com.esdllm</groupId>
             <artifactId>bilibili-api</artifactId>
-            <version>0.9.13.1-beta</version>
+            <version>0.9.13.2-beta</version>
         </dependency>
         <!-- SQLite JDBC Driver -->
         <dependency>

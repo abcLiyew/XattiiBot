@@ -7,6 +7,7 @@ import com.esdllm.bilibiliApi.model.data.pojo.LiveRoom;
 import com.esdllm.bilibiliApi.model.data.pojo.video.Staff;
 import com.esdllm.service.BilibiliAnalysis;
 import com.mikuac.shiro.common.utils.MsgUtils;
+import com.mikuac.shiro.common.utils.OneBotMedia;
 import com.mikuac.shiro.core.Bot;
 import com.mikuac.shiro.dto.event.message.AnyMessageEvent;
 import lombok.extern.slf4j.Slf4j;
@@ -139,10 +140,12 @@ public class BilibiliAnalysisImpl implements BilibiliAnalysis {
             if (!write){
                 return;
             }
+            OneBotMedia oneBotMedia = OneBotMedia.builder().file(dynamicFile.getCanonicalPath());
             String sendMsg = MsgUtils.builder().text(card.getDesc().getUser_profile().getInfo().getUname()+" 的动态：\n")
-                    .img(dynamicFile.getCanonicalPath()).text("https://www.bilibili.com/opus/"+card.getDesc().getDynamic_id_str())
+                    .img(oneBotMedia).text("https://www.bilibili.com/opus/"+card.getDesc().getDynamic_id_str())
                     .build();
             bot.sendMsg(event,sendMsg,false);
+            dynamicFile.deleteOnExit();
         }catch (Exception e){
             log.error("获取动态图片失败,动态id:{}",card.getDesc().getDynamic_id_str());
         }

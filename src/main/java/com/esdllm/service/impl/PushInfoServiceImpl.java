@@ -13,6 +13,7 @@ import com.esdllm.service.AdminService;
 import com.esdllm.service.PushInfoService;
 import com.esdllm.mapper.PushInfoMapper;
 import com.mikuac.shiro.common.utils.MsgUtils;
+import com.mikuac.shiro.common.utils.OneBotMedia;
 import com.mikuac.shiro.core.Bot;
 import com.mikuac.shiro.dto.action.common.ActionData;
 import com.mikuac.shiro.dto.action.response.GroupMemberInfoResp;
@@ -235,8 +236,9 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
             if (!write){
                 return;
             }
+            OneBotMedia oneBotMedia = OneBotMedia.builder().file(dynamicFile.getCanonicalPath());
             sendMsg = MsgUtils.builder().text(username + " 转发了动态\n原动态：\n")
-                    .img(dynamicFile.getCanonicalPath()).build();
+                    .img(oneBotMedia).build();
         }
 
         if (dynamicInfo.getDynamicId()!=null) {
@@ -244,8 +246,9 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
             if (!write){
                 return;
             }
+            OneBotMedia oneBotMedia = OneBotMedia.builder().file(dynamicFile.getCanonicalPath());
             sendMsg = MsgUtils.builder().text(username+"发表了动态")
-                    .img(dynamicFile.getCanonicalPath())
+                    .img(oneBotMedia)
                     .text("https://www.bilibili.com/opus/"+dynamicInfo.getDynamicId())
                     .build();
         }
