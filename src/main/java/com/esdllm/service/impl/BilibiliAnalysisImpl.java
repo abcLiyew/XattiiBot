@@ -5,17 +5,15 @@ import com.esdllm.bilibiliApi.model.BilibiliDynamicResp;
 import com.esdllm.bilibiliApi.model.data.VideoInfo;
 import com.esdllm.bilibiliApi.model.data.pojo.LiveRoom;
 import com.esdllm.bilibiliApi.model.data.pojo.video.Staff;
+import com.esdllm.contant.BiliBiliContant;
 import com.esdllm.service.BilibiliAnalysis;
 import com.mikuac.shiro.common.utils.MsgUtils;
-import com.mikuac.shiro.common.utils.OneBotMedia;
 import com.mikuac.shiro.core.Bot;
 import com.mikuac.shiro.dto.event.message.AnyMessageEvent;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
-import javax.imageio.ImageIO;
 import java.awt.image.BufferedImage;
-import java.io.File;
 import java.io.IOException;
 import java.text.SimpleDateFormat;
 import java.util.List;
@@ -132,22 +130,16 @@ public class BilibiliAnalysisImpl implements BilibiliAnalysis {
         Dynamic dynamic = new Dynamic();
         try {
             BufferedImage dynamicImg = dynamic.getDynamicImg(card.getDesc().getDynamic_id_str());
-            File dynamicFile = PushInfoServiceImpl.getDynamicFile(card.getDesc().getDynamic_id_str());
             if (Objects.isNull(dynamicImg)){
                 return;
             }
-            boolean write = ImageIO.write(dynamicImg, "jpg", dynamicFile);
-            if (!write){
-                return;
-            }
-            OneBotMedia oneBotMedia = OneBotMedia.builder().file(dynamicFile.getCanonicalPath());
+            String base64Image = BiliBiliContant.imgToBase64(dynamicImg);
             String sendMsg = MsgUtils.builder().text(card.getDesc().getUser_profile().getInfo().getUname()+" 的动态：\n")
-                    .img(oneBotMedia).text("https://www.bilibili.com/opus/"+card.getDesc().getDynamic_id_str())
+                    .img("base64://"+base64Image).text("https://www.bilibili.com/opus/"+card.getDesc().getDynamic_id_str())
                     .build();
             bot.sendMsg(event,sendMsg,false);
-            dynamicFile.deleteOnExit();
         }catch (Exception e){
-            log.error("获取动态图片失败,动态id:{}",card.getDesc().getDynamic_id_str());
+            log.error("获取动态图片失败,动态id:{}",card.getDesc().getDynamic_id_str(),e);
         }
     }
 

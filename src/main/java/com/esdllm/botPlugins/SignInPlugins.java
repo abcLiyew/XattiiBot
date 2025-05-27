@@ -73,6 +73,7 @@ public class SignInPlugins {
         }
         loadDSConfig.updateConfig("botQQ",botQQ.toString());
         config = loadDSConfig.getConfigMap();
+        log.info("botQQ更新成功");
     }
     @AnyMessageHandler
     @MessageHandlerFilter(cmd = "签到",at = AtEnum.BOTH)
