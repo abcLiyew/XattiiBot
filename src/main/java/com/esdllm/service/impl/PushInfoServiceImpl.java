@@ -6,6 +6,7 @@ import com.esdllm.bilibiliApi.bilibiliApi.BilibiliClient;
 import com.esdllm.bilibiliApi.bilibiliApi.CardInfo;
 import com.esdllm.bilibiliApi.bilibiliApi.Dynamic;
 import com.esdllm.bilibiliApi.bilibiliApi.Live;
+import com.esdllm.contant.BiliBiliContant;
 import com.esdllm.model.Admin;
 import com.esdllm.model.PushInfo;
 import com.esdllm.model.respObj.PushInfoResp;
@@ -13,7 +14,6 @@ import com.esdllm.service.AdminService;
 import com.esdllm.service.PushInfoService;
 import com.esdllm.mapper.PushInfoMapper;
 import com.mikuac.shiro.common.utils.MsgUtils;
-import com.mikuac.shiro.common.utils.OneBotMedia;
 import com.mikuac.shiro.core.Bot;
 import com.mikuac.shiro.dto.action.common.ActionData;
 import com.mikuac.shiro.dto.action.response.GroupMemberInfoResp;
@@ -22,9 +22,7 @@ import jakarta.annotation.Resource;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.stereotype.Service;
 
-import javax.imageio.ImageIO;
 import java.awt.image.BufferedImage;
-import java.io.File;
 import java.io.IOException;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
@@ -226,48 +224,28 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
                     ).build();
         }
         String dynamicId = dynamicInfo.getDynamicId()==null?dynamicInfo.getShareDynamicId()==null?new Date().toString():dynamicInfo.getShareDynamicId():dynamicInfo.getDynamicId();
-        File dynamicFile = getDynamicFile(dynamicId);
         if (dynamicInfo.getShareDynamicId()!= null){
             BufferedImage dynamicImg = dynamic.getDynamicImg(dynamicInfo.getShareDynamicId());
             if (Objects.isNull(dynamicImg)){
                 return;
             }
-            boolean write = ImageIO.write(dynamicImg, "jpg", dynamicFile);
-            if (!write){
-                return;
-            }
-            OneBotMedia oneBotMedia = OneBotMedia.builder().file(dynamicFile.getCanonicalPath());
+            String base64Image = BiliBiliContant.imgToBase64(dynamicImg);
             sendMsg = MsgUtils.builder().text(username + " 转发了动态\n原动态：\n")
-                    .img(oneBotMedia).build();
+                    .img("base64://"+base64Image).build();
         }
 
         if (dynamicInfo.getDynamicId()!=null) {
-            boolean write = ImageIO.write(dynamic.getDynamicImg(dynamicInfo.getDynamicId()), "jpg", dynamicFile);
-            if (!write){
+            BufferedImage dynamicImg = dynamic.getDynamicImg(dynamicId);
+            if (Objects.isNull(dynamicImg)){
                 return;
             }
-            OneBotMedia oneBotMedia = OneBotMedia.builder().file(dynamicFile.getCanonicalPath());
+            String base64Image = BiliBiliContant.imgToBase64(dynamicImg);
             sendMsg = MsgUtils.builder().text(username+"发表了动态")
-                    .img(oneBotMedia)
+                    .img("base64://"+base64Image)
                     .text("https://www.bilibili.com/opus/"+dynamicInfo.getDynamicId())
                     .build();
         }
         sendMessage(bot, pushInfo, sendMsg);
-        dynamicFile.deleteOnExit();
-    }
-
-    public static File getDynamicFile(String dynamicId) throws IOException {
-        String imgPath = "temp/dynamic" + dynamicId + ".jpg";
-        File  dynamicFile = new File(imgPath);
-        if (!dynamicFile.exists() && !dynamicFile.getParentFile().exists()) {
-            if (!dynamicFile.getParentFile().mkdirs()) {
-                throw new IOException("无法创建动态文件的父目录: " + dynamicFile.getParent());
-            }
-        }
-        if (!dynamicFile.exists() && !dynamicFile.createNewFile()) {
-            throw new IOException("无法创建动态文件: " + dynamicFile.getAbsolutePath());
-        }
-        return dynamicFile;
     }
 
     /**
