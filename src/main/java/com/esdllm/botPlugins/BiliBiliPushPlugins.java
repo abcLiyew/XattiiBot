@@ -113,14 +113,15 @@ public class BiliBiliPushPlugins {
     }
 
     @Async
-    @Scheduled(fixedRate = 30000)
+    @Scheduled(fixedRate = 40000)
     public void dynamicPush() throws InterruptedException {
         long startTime = System.currentTimeMillis();
         Bot bot = getBotFromConfig();
 
         pushInfoService.dynamicPush(bot);
         long endTime = System.currentTimeMillis();
-        if (endTime - startTime > 30000) {
+        System.gc();
+        if (endTime - startTime > 40000) {
             log.warn("动态推送耗时过长，耗时：{}ms", endTime - startTime);
         }else {
             Thread.sleep(20000 - (endTime - startTime));

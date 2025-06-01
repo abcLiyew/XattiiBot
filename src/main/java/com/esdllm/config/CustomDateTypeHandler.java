@@ -27,6 +27,9 @@ public class CustomDateTypeHandler extends BaseTypeHandler<List<Long>> {
         if (dataColumnName instanceof String) {
             // 去除方括号并分割字符串
             String[] stringArray = ((String) dataColumnName).replaceAll("[\\[\\]]", "").split(",\\s*");
+            if (stringArray.length == 0 || stringArray[0].isEmpty()) {
+                return new ArrayList<>(); // 列表为空时返回空列表
+            }
             List<Long> result = new ArrayList<>();
             for (String item : stringArray) {
                 try {
