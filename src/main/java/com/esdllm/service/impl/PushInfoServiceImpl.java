@@ -267,7 +267,7 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
             processLiveStartTime(pushInfo, live);
 
             // 根据不同情况构建开播消息
-            if (isGroupAdmin(bot, pushInfo.getGroupId()) && pushInfo.getAtAll().equals(1)) {
+            if (pushInfo.getAtAll().equals(1) && isGroupAdmin(bot, pushInfo.getGroupId()) ) {
                 return buildAtAllLiveMessage(userName, live, roomId);
             } else if (!atListStr.isEmpty() && !atListStr.get(0).equals(0L)) {
                 return buildAtUserLiveMessage(atListStr, userName, live, roomId);
