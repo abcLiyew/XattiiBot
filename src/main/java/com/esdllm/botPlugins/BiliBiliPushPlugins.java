@@ -120,7 +120,6 @@ public class BiliBiliPushPlugins {
 
         pushInfoService.dynamicPush(bot);
         long endTime = System.currentTimeMillis();
-        System.gc();
         if (endTime - startTime > 40000) {
             log.warn("动态推送耗时过长，耗时：{}ms", endTime - startTime);
         }else {
