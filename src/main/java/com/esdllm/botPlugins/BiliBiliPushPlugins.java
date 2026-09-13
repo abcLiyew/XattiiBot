@@ -18,6 +18,8 @@ import org.springframework.scheduling.annotation.Async;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
+import java.util.concurrent.atomic.AtomicBoolean;
+
 @Slf4j
 @Component
 @Shiro
@@ -112,18 +114,54 @@ public class BiliBiliPushPlugins {
         pushInfoService.livePush(bot);
     }
 
-    @Async
-    //@Scheduled(fixedRate = 40000)
-    public void dynamicPush() throws InterruptedException {
-        long startTime = System.currentTimeMillis();
-        Bot bot = getBotFromConfig();
+    /**
+     * 动态推送重入保护：上一轮还没跑完就跳过本轮。
+     *
+     * <p>{@code @Async} + {@code @Scheduled} 的组合下，调度线程是「把方法丢给线程池就返回」，
+     * 它并不知道异步任务何时结束；而一轮动态推送要发 HTTP 拉 feed、下载图片、Java2D 渲染，
+     * 耗时完全可能超过调度间隔。没有这道闸，慢的一轮会和下一轮叠成并发请求 ——
+     * 既浪费请求配额，也正是把 B 站风控（-352）招来的原因。
+     */
+    private final AtomicBoolean dynamicPushRunning = new AtomicBoolean(false);
 
-        pushInfoService.dynamicPush(bot);
-        long endTime = System.currentTimeMillis();
-        if (endTime - startTime > 40000) {
-            log.warn("动态推送耗时过长，耗时：{}ms", endTime - startTime);
-        }else {
-            Thread.sleep(20000 - (endTime - startTime));
+    /**
+     * 动态推送（每 60 秒一轮）
+     *
+     * <p>与 {@link #livePush()} 同源：从 config 表读 botQQ 找 Bot 实例，
+     * 真正的判断/发送逻辑在 {@code PushInfoServiceImpl.dynamicPush}。
+     *
+     * <p><b>为什么是 60 秒而不是更快</b>：动态推送是本项目对 {@code api.bilibili.com}
+     * 唯一的周期性出站流量，而 B 站的 412 是"请求密度"敏感型风控（实测 1 秒内 3 个请求就触发）。
+     * 60 秒 × 每 uid 1 次请求已经足够及时（配合 15 分钟的新鲜窗口与末次去重，
+     * 真正的新动态最迟 60 秒内必推，且不会重复），却是对出口 IP 最友好的节奏。
+     */
+    @Async
+    @Scheduled(fixedRate = 60000)
+    public void dynamicPush() {
+        if (!dynamicPushRunning.compareAndSet(false, true)) {
+            log.warn("上一轮动态推送尚未结束，跳过本轮");
+            return;
+        }
+        try {
+            Bot bot = getBotFromConfig();
+            if (bot == null) {
+                return;
+            }
+            long startTime = System.currentTimeMillis();
+            pushInfoService.dynamicPush(bot);
+            long cost = System.currentTimeMillis() - startTime;
+            if (cost > 60000) {
+                log.warn("动态推送耗时过长，耗时：{}ms", cost);
+            } else {
+                log.info("动态推送完成，耗时：{}ms", cost);
+            }
+        } catch (Throwable e) {
+            // ★ Throwable 而非 Exception：无字体环境下 Java2D 抛的是 java.lang.InternalError，
+            //   它是 Error，catch(Exception) 兜不住，会一路冲到 AsyncUncaughtExceptionHandler，
+            //   整轮推送就此中断（2026-09-14 真机踩到）。
+            log.error("动态推送执行异常", e);
+        } finally {
+            dynamicPushRunning.set(false);
         }
     }
 

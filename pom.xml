@@ -51,7 +51,7 @@
         <dependency>
             <groupId>com.esdllm</groupId>
             <artifactId>bilibili-api</artifactId>
-            <version>0.9.20-beta</version>
+            <version>0.9.28-beta</version>
         </dependency>
 
         <!-- Lombok：bilibili-api 0.9.20-beta 起把 lombok 声明为 provided（不向下游传递），

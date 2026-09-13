@@ -6,11 +6,11 @@ import com.esdllm.bilibiliApi.bilibiliApi.BilibiliClient;
 import com.esdllm.bilibiliApi.bilibiliApi.CardInfo;
 import com.esdllm.bilibiliApi.bilibiliApi.Dynamic;
 import com.esdllm.bilibiliApi.bilibiliApi.Live;
+import com.esdllm.common.BotAdminChecker;
+import com.esdllm.config.LoadDSConfig;
 import com.esdllm.contant.BiliBiliContant;
-import com.esdllm.model.Admin;
 import com.esdllm.model.PushInfo;
 import com.esdllm.model.respObj.PushInfoResp;
-import com.esdllm.service.AdminService;
 import com.esdllm.service.PushInfoService;
 import com.esdllm.mapper.PushInfoMapper;
 import com.mikuac.shiro.common.utils.MsgUtils;
@@ -18,6 +18,7 @@ import com.mikuac.shiro.core.Bot;
 import com.mikuac.shiro.dto.action.common.ActionData;
 import com.mikuac.shiro.dto.action.response.GroupMemberInfoResp;
 import com.mikuac.shiro.dto.event.message.AnyMessageEvent;
+import jakarta.annotation.PostConstruct;
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
@@ -29,9 +30,20 @@ import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
 * @author LiYehe
@@ -45,11 +57,159 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
     private static final ThreadLocal<SimpleDateFormat> SAFE_DATE_FORMAT =
             ThreadLocal.withInitial(() -> new SimpleDateFormat("yyyy-MM-dd HH:mm:ss"));
 
+    /**
+     * 每个订阅（{@code pid}）<b>已经推送过</b>的动态 ID 集合，用于去重。
+     *
+     * <p><b>为什么必须有</b>：动态推送的触发依据是「这条动态的发布时间文案很新」，
+     * 而这类文案（如「刚刚」）会在约 1 分钟内持续命中 —— 在轮询间隔下，
+     * 同一条新动态会被连续几轮都判成「新」，没有去重就会刷出好几条一模一样的推送。
+     *
+     * <p><b>为什么是集合而不是"最后一条"</b>（2026-09-14 真机日志抓到）：
+     * 原来只记"最后推的那一条"，于是当 UP <b>连续发动态</b>时（实测某个 UP 每分钟一条）——
+     * 第 N 轮推了 B，第 N+1 轮 B 被去重跳过、但又轮到上一轮推过的 A（仍在新鲜窗口内）→
+     * <b>A 被重复推送</b>。只要"新鲜窗口内同时存在两条以上动态"，这个漏洞就会暴露。
+     *
+     * <p><b>为什么必须落库</b>（2026-09-14 真机日志实锤）：这个集合原来只在内存里，
+     * 进程一重启就清空；而触发推送的依据是「这条动态的发布时间落在 {@link #RECENT_MINUTES}
+     * 分钟窗口内」，于是<b>每次重启都会把上一轮已经推过的动态原样再推一遍</b>。
+     * 实测：{@code dynamicId=1247605274155417607}（发布于 01:06）先被推过一次，
+     * 01:12 重启后 01:13 又推了一次 —— 用户看到的现象就是"去重没生效"。
+     * 重启在开发期很频繁（每次改完代码 {@code ./start.sh} 都算），所以这不是小概率事件。
+     *
+     * <p>现在每次推送后都会把整个映射写回 {@code config} 表的
+     * {@link LoadDSConfig#KEY_PUSHED_DYNAMIC_IDS}，启动时再读回来（见 {@link #loadPushedIds}）。
+     * 之所以放在既有的 {@code config} 键值表里而不是新建表：SQLite/MySQL 两套数据源都得建表，
+     * 而这张表本来就是通用的 KV，加一个键零迁移、且用户可以直接用 SQL 查看/清空。
+     */
+    private final Map<Long, Set<String>> pushedDynamicIds = new ConcurrentHashMap<>();
+
+    /**
+     * 进程启动时刻（毫秒），只用于冷启动判定，见 {@link #isColdStartBacklog}。
+     */
+    private final long bootTimeMillis = System.currentTimeMillis();
+
+    /**
+     * <b>冷启动订阅</b>：进程启动时就存在、但库里<b>没有</b>它们的去重记录的订阅（{@code pid}）。
+     *
+     * <p>只可能是两种情况：① 本特性首次部署；② 去重记录被清空。这两种情况下我们"失忆"了，
+     * 无法知道 15 分钟窗口里的动态有没有推过 —— 此时的选择是<b>不回补</b>（把它们静默记为已推），
+     * 因为"重启就重刷一遍旧动态"正是用户投诉的问题，而漏推一条旧动态的代价小得多。
+     *
+     * <p>注意<b>不含</b>之后才新增的订阅：新订阅的语义是"从现在起有动静就告诉我"，
+     * 它的第一轮该推什么就推什么，不受这里影响（见 {@link #loadPushedIds}）。
+     */
+    private final Set<Long> coldStartPids = ConcurrentHashMap.newKeySet();
+
+    /** 去重映射有变化、还没写回库里（见 {@link #persistPushedIdsIfDirty}） */
+    private volatile boolean pushedStateDirty = false;
+
+    /**
+     * 每个订阅最多记住多少条已推动态（超出后按插入顺序淘汰最旧的）。
+     *
+     * <p>关注流首页只有 ~22 条，200 远超"新鲜窗口内可能出现的条数"，实际不会触发淘汰；
+     * 设上限只是为了防止长期运行后无限增长。
+     */
+    private static final int PUSHED_HISTORY_PER_SUB = 200;
+
+    /** 「N 分钟前」的匹配器，配合 {@link #RECENT_MINUTES} 使用，见 {@link #isFresh(String)} */
+    private static final Pattern MINUTES_AGO = Pattern.compile("^(\\d+)分钟前");
+
+    /**
+     * 动态推送的「新鲜度」窗口（分钟）。
+     *
+     * <p>见 {@link #isFresh(String)}：放宽到 N 分钟是为了补回被轮询间隔甩掉的新动态。
+     *
+     * <p><b>必须大于风控冷却上限</b>（见 {@link #RISK_COOLDOWN_MAX_MS}）：否则冷却期间发出的动态，
+     * 等冷却结束回来时已经"超过 N 分钟"，会被判成不新鲜而<b>永久漏推</b>。
+     * 末次去重（{@link #pushedDynamicIds}）保证窗口放宽不会变成重复刷屏。
+     */
+    private static final int RECENT_MINUTES = 15;
+
+    /** 风控冷却的起始时长（毫秒） */
+    private static final long RISK_COOLDOWN_BASE_MS = 60_000L;
+    /**
+     * 风控冷却的上限（毫秒）。
+     *
+     * <p><b>刻意压在 {@link #RECENT_MINUTES} 分钟以内</b>：冷却期间发出的动态，
+     * 恢复后仍然落在新鲜窗口里，所以「退避」不会变成「漏推」。
+     */
+    private static final long RISK_COOLDOWN_MAX_MS = 8 * 60_000L;
+
+    /**
+     * 风控冷却截止时间戳（毫秒）。大于当前时间表示还在冷却中，本轮直接跳过。
+     *
+     * <p><b>为什么必须有</b>：实测 B 站的 412 是<b>惩罚窗口</b>行为 —— 短时间内对
+     * {@code api.bilibili.com} 连发几个请求就被判 412，之后一段时间内<b>所有</b>请求继续 412。
+     * 动态推送原本是"每 40 秒拉一次，失败就轮换身份并立刻重试"，等于<b>每轮主动把窗口续期</b>，
+     * 结果就是永久 412（2026-09-13 真机日志实测：连续多轮 100% 412）。
+     * 冷却让出口 IP 真正安静下来，窗口才会过期。
+     */
+    private volatile long riskCooldownUntil = 0L;
+
+    /** 连续失败的轮数，用于让冷却时长递增（1 → 2 → 4 → 8 分钟封顶） */
+    private volatile int consecutiveFailures = 0;
+
+    /**
+     * 已经打过完整堆栈的失败轮数计数（见 {@link #logFetchFailure}）。
+     *
+     * <p>风控持续期间每轮都会失败，若每次都打 20 行堆栈，日志会被淹掉、真正有用的
+     * "出站身份 / 策略"那几行反而看不见。所以只在第 1 次和每 10 次打完整堆栈，其余打一行。
+     */
+    private volatile int failuresLogged = 0;
+
+
+    /**
+     * 是否改用<b>关注流</b>（{@code feed/all}）作为动态数据源。
+     *
+     * <p><b>为什么需要</b>（2026-09-14 真机实测）：B 站 WAF 会按客户端封禁
+     * {@code x/polymer/web-dynamic/v1/feed/space} —— 同机同 Cookie 下
+     * {@code x/frontend/finger/spi} 返回 200、{@code feed/all} 返回 200/code=0，
+     * 只有 feed/space 返回 {@code {"code":-412,"message":"request was banned"}}。
+     * 换 buvid、换请求头形状、拉长间隔都无效（不是频率问题，是"这条路被封"）。
+     *
+     * <p>一旦命中就<b>粘住</b>（重启后重新探测）：关注流一轮 1 次请求覆盖所有已关注 UP，
+     * 比原来"每个 uid 1 次"更省请求，且实测在被封的机器上可用。
+     *
+     * <p>代价：关注流只包含该 B 站账号<b>已关注</b>的 UP；未关注的订阅会推不到，
+     * 由 {@link #warnUidsMissingFromFollowFeed} 告警提示。
+     */
+    private volatile boolean preferFollowFeed = false;
+
+    /** 上次提醒"某 UP 不在关注流里"的时间戳，避免每轮刷屏 */
+    private volatile long lastMissingUidWarnAt = 0L;
+
+    /** 「不在关注流里」告警的最小间隔（毫秒） */
+    private static final long MISSING_UID_WARN_INTERVAL_MS = 30 * 60_000L;
+
+    /** 上次应用过的「数据源偏好」配置值，只在配置变化时重新应用（见 {@link #applyConfiguredSource}） */
+    private volatile String appliedSourceConfig = null;
+
+    /**
+     * 关注流模式下，多久回探一次 {@code feed/space}（毫秒）。
+     *
+     * <p><b>为什么需要回探</b>：切关注流的原因不是"接口不能用"，而是
+     * <b>这条路径对该客户端被封</b> —— 真机对照（2026-09-14，同一枚 Cookie、同一分钟、同一客户端）：
+     * 住宅出口 {@code HTTP 200 / code=0 / 13 条}，服务器香港出口
+     * {@code HTTP 412 {"code":-412,"message":"request was banned"}}。
+     * 这种封禁不会永久有效，但它也不会通知我们，所以每 30 分钟花<b>一个请求</b>去敲门：
+     * 通了就切回空间动态（语义更准，且不受"账号必须已关注该 UP"的限制）。
+     */
+    private static final long SPACE_FEED_PROBE_INTERVAL_MS = 30 * 60_000L;
+
+    /**
+     * 下次回探 {@code feed/space} 的时间戳。
+     *
+     * <p>{@link Long#MAX_VALUE} 表示"永不回探"—— 用于配置里显式写了
+     * {@code biliDynamicSource=follow} 的场景（用户明确要求用关注流，就别自作主张切回去）。
+     */
+    private volatile long nextSpaceFeedProbeAt = 0L;
 
     @Resource
     PushInfoMapper pushInfoMapper;
     @Resource
-    private AdminService adminService;
+    private BotAdminChecker botAdminChecker;
+    @Resource
+    private LoadDSConfig loadDSConfig;
 
     @Override
     public PushInfoResp pushAdd(Long roomId, AnyMessageEvent event) {
@@ -178,32 +338,607 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
 
     @Override
     public void dynamicPush(Bot bot) {
+        // 风控冷却中：直接跳过这一轮，别再去续期惩罚窗口
+        long now = System.currentTimeMillis();
+        if (now < riskCooldownUntil) {
+            log.info("动态推送处于风控冷却中，还需 {} 秒（让 B 站惩罚窗口自然过期，避免越打越死）",
+                    (riskCooldownUntil - now) / 1000);
+            return;
+        }
+
         List<PushInfo> list = pushInfoMapper.selectList(null);
+        // 配置表里的数据源偏好（auto/follow/space），改了即时生效
+        applyConfiguredSource();
         // 创建一次对象，避免在循环中重复创建
         Live liveRoom = new Live();
         CardInfo cardInfo = new CardInfo();
         Dynamic dynamic = new Dynamic();
 
+        // 同一个 UP（uid）往往被多个群/私聊同时订阅。若每条订阅都独立拉一次 feed，
+        // 一轮内就会对 B 站重复请求 N 次，既浪费也更易撞上 -352 风控。
+        // 这里按 uid 做「一轮内」缓存：同一 uid 只请求一次；
+        // ★ 拉取失败也写缓存（空列表），否则同一 uid 的其它订阅会在同一轮里继续重试，
+        //   把一次风控放大成 N 次。
+        Map<Long, List<Dynamic.DynamicInfo>> feedCache = new HashMap<>();
+        boolean anyFetchFailure = false;
+
+        // —— 关注流模式（见 #preferFollowFeed）：整轮只拉一次，全部订阅共用 ——
+        // null 表示"本轮还没拉"；拉失败后置 followFeedFailed，避免同一轮里重复撞
+        Map<Long, List<Dynamic.DynamicInfo>> followByUid = null;
+        boolean followFeedFailed = false;
+        // 本轮涉及的订阅 uid，用于"某 UP 没出现在关注流里"的告警（关注流只含已关注的 UP）
+        Set<Long> subscribedUids = new HashSet<>();
+
         for (PushInfo pushInfo : list) {
-            if (!pushInfo.getDynamicPush().equals(0)){
+            if (!Objects.equals(pushInfo.getDynamicPush(), 0)) {
                 continue;
             }
-            Long uid = liveRoom.getUid(pushInfo.getRoomId());
             try {
-                List<Dynamic.DynamicInfo> dynamicInfoList = dynamic.getDynamicInfoList(String.valueOf(uid));
-                String username = cardInfo.getUserName(uid);
-                for (Dynamic.DynamicInfo dynamicInfo : dynamicInfoList) {
-                    if (dynamicInfo.getTime().startsWith("刚刚")){
-                        sendMsg(username,dynamic,dynamicInfo,bot,pushInfo);
-                        break;
+                // 注意：取 uid 也可能抛异常，必须放在 try 内；留在外面会让一条订阅的失败
+                // 直接中断整个 for 循环，后面的订阅全部不再推送。
+                Long uid = liveRoom.getUid(pushInfo.getRoomId());
+                if (uid == null) {
+                    log.warn("直播间 {} 取不到 uid，跳过其动态推送", pushInfo.getRoomId());
+                    continue;
+                }
+                subscribedUids.add(uid);
+
+                // ★ 关注流只是"feed/space 被封时的替代品"，不是永久选择。定期回探一次：
+                //   通了就切回空间动态（语义更准，也不要求"该账号必须已关注这个 UP"）。
+                //   一轮最多回探一次（markSpaceFeedProbed 会把下次时间推后）。
+                List<Dynamic.DynamicInfo> probedSpaceFeed = null;
+                if (preferFollowFeed && spaceFeedProbeDue()) {
+                    markSpaceFeedProbed();
+                    probedSpaceFeed = tryFetchSpaceFeed(uid);
+                    if (probedSpaceFeed != null) {
+                        preferFollowFeed = false;
+                        feedCache.put(uid, probedSpaceFeed);
                     }
                 }
 
-            }catch (Exception e){
+                List<Dynamic.DynamicInfo> dynamicInfoList;
+                if (preferFollowFeed) {
+                    if (followByUid == null && !followFeedFailed) {
+                        try {
+                            followByUid = groupByUid(dynamic.getFollowFeed());
+                            log.info("关注流已加载：{} 条动态，覆盖 {} 个 UP",
+                                    followByUid.values().stream().mapToInt(List::size).sum(),
+                                    followByUid.size());
+                        } catch (Exception e) {
+                            followFeedFailed = true;
+                            anyFetchFailure = true;
+                            logFetchFailure(uid, e);
+                        }
+                    }
+                    if (followByUid == null) {
+                        // 关注流没拉到手：本轮放弃（下面统一进冷却）
+                        continue;
+                    }
+                    dynamicInfoList = followByUid.getOrDefault(uid, List.of());
+                } else if (probedSpaceFeed != null) {
+                    // 回探成功的那一次结果直接复用，避免同一 uid 在同一轮里请求两次
+                    dynamicInfoList = probedSpaceFeed;
+                } else {
+                    dynamicInfoList = feedCache.get(uid);
+                    if (dynamicInfoList == null) {
+                        try {
+                            dynamicInfoList = dynamic.getDynamicInfoList(String.valueOf(uid));
+                        } catch (Exception e) {
+                            dynamicInfoList = List.of();
+                            logFetchFailure(uid, e);
+                            if (looksLikeBlocked(e)) {
+                                // ★ feed/space 被判 -412 是"这条路被封"，不是"环境暂时不稳"：
+                                //   换 buvid、换请求头、拉长间隔都没用（真机实测），所以
+                                //   ① 立刻切到关注流（本轮起后面的订阅就走新源）；
+                                //   ② **不计入风控冷却** —— 冷却解决不了路径级封禁，只会白白推迟推送。
+                                switchToFollowFeed(e);
+                            } else {
+                                // 真·瞬时失败（超时/网络）：本轮该 uid 放弃，并让下一轮退避
+                                anyFetchFailure = true;
+                            }
+                        }
+                        feedCache.put(uid, dynamicInfoList);
+                    }
+                }
+                if (dynamicInfoList.isEmpty()) {
+                    continue;
+                }
+
+                // 昵称优先取动态自带的（关注流里就有），省掉一次名片接口请求 —— 请求密度正是风控敏感项
+                String username = firstNonBlank(dynamicInfoList.get(0).getUserName(), null);
+                if (username == null) {
+                    username = cardInfo.getUserName(uid);
+                }
+                for (Dynamic.DynamicInfo dynamicInfo : dynamicInfoList) {
+                    if (!isFresh(dynamicInfo.getTime())) {
+                        continue;
+                    }
+                    String dynamicKey = dynamicInfo.getDynamicId() != null
+                            ? dynamicInfo.getDynamicId()
+                            : dynamicInfo.getShareDynamicId();
+                    if (dynamicKey == null) {
+                        continue;
+                    }
+                    if (alreadyPushed(pushInfo.getPid(), dynamicKey)) {
+                        // 这条已经推过了（同一动态会在「新鲜窗口」内连续几轮都命中），跳过
+                        continue;
+                    }
+                    if (isColdStartBacklog(pushInfo.getPid(), dynamicInfo.getTime())) {
+                        // 冷启动时的存量动态：库里没有去重记录，无法判断推没推过，
+                        // 与其重推一遍（用户投诉的正是这个），不如静默记为已推、只等新动态。
+                        log.debug("冷启动跳过存量动态：uid={}, dynamicId={}, time={}",
+                                uid, dynamicKey, dynamicInfo.getTime());
+                        markPushed(pushInfo.getPid(), dynamicKey);
+                        continue;
+                    }
+                    log.info("推送动态：uid={}, dynamicId={}, time={}, 目标={}",
+                            uid, dynamicKey, dynamicInfo.getTime(),
+                            pushInfo.getGroupId() != null ? "群" + pushInfo.getGroupId()
+                                    : "私聊" + pushInfo.getQqUid());
+                    sendMsg(username, dynamic, dynamicInfo, bot, pushInfo);
+                    markPushed(pushInfo.getPid(), dynamicKey);
+                    break;
+                }
+            } catch (Throwable e) {
+                // ★ 兜 Throwable 而不是 Exception：见 renderDynamicImage 的注释 ——
+                //   无字体环境下的字体管理器初始化失败抛的是 java.lang.InternalError（Error），
+                //   用 catch(Exception) 会让它在「发消息之前」穿出整轮推送，用户什么都收不到。
+                //   一条订阅出问题不该带走整轮。
                 log.error("处理动态推送信息时发生异常，房间ID: " + pushInfo.getRoomId(), e);
             }
         }
 
+        // 关注流模式下提醒"哪些被订阅的 UP 不在关注流里"——用户需要去关注它们，否则永远推不到
+        if (preferFollowFeed && followByUid != null && !followByUid.isEmpty()) {
+            warnUidsMissingFromFollowFeed(subscribedUids, followByUid.keySet());
+        }
+
+        // 把一个轮次里产生的去重记录一次性写回库里 —— 重启后靠它避免重推（见 loadPushedIds）
+        persistPushedIdsIfDirty();
+
+        if (anyFetchFailure) {
+            enterRiskCooldown();
+        } else {
+            // 整轮都拿到了列表 → 说明数据源是通的，把递增计数清零
+            failuresLogged = 0;
+            if (consecutiveFailures != 0) {
+                log.info("动态推送恢复正常（此前连续失败 {} 轮）", consecutiveFailures);
+                consecutiveFailures = 0;
+            }
+        }
+    }
+
+    /**
+     * 应用配置表里的「数据源偏好」（{@link LoadDSConfig#KEY_BILI_DYNAMIC_SOURCE}）。
+     *
+     * <p>只在配置值<b>变化时</b>应用一次，这样 {@code auto} 模式下运行期自动切到关注流后不会被
+     * 每轮重新拽回空间动态（那会变成"每轮白撞一次 feed/space"的抖动）。
+     *
+     * <ul>
+     *   <li>{@code follow} → 直接用关注流（重启后不再白撞 feed/space）；</li>
+     *   <li>{@code space} → 强制按 uid 拉空间动态（未被封的环境用）；</li>
+     *   <li>{@code auto}/未配置 → 保持自动判断。</li>
+     * </ul>
+     */
+    private void applyConfiguredSource() {
+        if (loadDSConfig == null) {
+            return;
+        }
+        String mode = loadDSConfig.getConfigMap().get(LoadDSConfig.KEY_BILI_DYNAMIC_SOURCE);
+        String normalized = mode == null || mode.isBlank() ? "auto" : mode.trim().toLowerCase();
+        if (normalized.equals(appliedSourceConfig)) {
+            return;
+        }
+        appliedSourceConfig = normalized;
+        switch (normalized) {
+            case "follow" -> {
+                preferFollowFeed = true;
+                // 用户显式要求关注流 → 不再回探（免得把配置"改回去"了）
+                nextSpaceFeedProbeAt = Long.MAX_VALUE;
+                log.info("按配置 {}={} 使用「关注流」数据源（一轮 1 次请求覆盖所有已关注 UP）",
+                        LoadDSConfig.KEY_BILI_DYNAMIC_SOURCE, normalized);
+            }
+            case "space" -> {
+                preferFollowFeed = false;
+                nextSpaceFeedProbeAt = 0L;
+                log.info("按配置 {}={} 使用「空间动态」数据源（按 uid 逐个拉取）",
+                        LoadDSConfig.KEY_BILI_DYNAMIC_SOURCE, normalized);
+            }
+            default -> log.info("数据源按自动判断（先试空间动态，被判风控则改用关注流）");
+        }
+    }
+
+    /**
+     * 把关注流的动态按发布者 uid 归组，便于按订阅取用。
+     *
+     * @param feed 关注流结果
+     * @return uid → 该 UP 的动态（保持原顺序）
+     */
+    private static Map<Long, List<Dynamic.DynamicInfo>> groupByUid(List<Dynamic.DynamicInfo> feed) {
+        Map<Long, List<Dynamic.DynamicInfo>> result = new LinkedHashMap<>();
+        if (feed == null) {
+            return result;
+        }
+        for (Dynamic.DynamicInfo info : feed) {
+            if (info == null || info.getUid() == null) {
+                continue;
+            }
+            try {
+                result.computeIfAbsent(Long.parseLong(info.getUid()), k -> new ArrayList<>()).add(info);
+            } catch (NumberFormatException e) {
+                // uid 不是数字（异常形态）：跳过这条，不影响其它
+                log.debug("关注流里出现非数字 uid，已跳过：{}", info.getUid());
+            }
+        }
+        return result;
+    }
+
+    /**
+     * 异常是否属于"这条路径被 B 站封了"。
+     *
+     * <p>真机实测的形态是 {@code HTTP 412} + 业务码 {@code -412} 与文案
+     * {@code request was banned}（库把它转成带"HTTP 412，命中 B 站风控"的消息）。
+     * 这类失败<b>重试、换指纹、换请求头都无用</b>，只能换数据源 —— 所以必须与"超时/网络抖动"区分开。
+     *
+     * @param e 异常
+     * @return 是否为路径级封禁
+     */
+    private static boolean looksLikeBlocked(Throwable e) {
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            String msg = t.getMessage();
+            if (msg == null) {
+                continue;
+            }
+            String lower = msg.toLowerCase();
+            if (lower.contains("412") || lower.contains("banned") || msg.contains("风控")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 切到关注流数据源（本进程内粘性，但会按 {@link #SPACE_FEED_PROBE_INTERVAL_MS} 定期回探
+     * {@code feed/space}，通了就切回去 —— 见 {@link #nextSpaceFeedProbeAt}）。
+     *
+     * <p>什么时候触发：{@code feed/space} 被 -412 封禁时（见 {@link #looksLikeBlocked}）。
+     * 关注流的优势是一轮只发 1 次请求就覆盖所有已关注 UP，且实测在 feed/space 被封的机器上可用。
+     *
+     * @param cause 触发切换的异常
+     */
+    private void switchToFollowFeed(Exception cause) {
+        if (preferFollowFeed) {
+            return;
+        }
+        preferFollowFeed = true;
+        // 刚被拒过，先隔一个间隔再回探（免得"每轮敲一次门"反而把封禁喂得更牢）
+        nextSpaceFeedProbeAt = System.currentTimeMillis() + SPACE_FEED_PROBE_INTERVAL_MS;
+        log.warn("feed/space 被判风控（{}）→ 本轮起改用「关注流」数据源（一轮 1 次请求覆盖所有 UP）。"
+                + "注意：关注流只包含该 B 站账号【已关注】的 UP，未关注的订阅推不到；"
+                + "之后每 {} 分钟会回探一次 feed/space，通了自动切回。",
+                cause.getMessage(), SPACE_FEED_PROBE_INTERVAL_MS / 60000);
+    }
+
+    /** 是否到了回探 {@code feed/space} 的时间 */
+    private boolean spaceFeedProbeDue() {
+        return System.currentTimeMillis() >= nextSpaceFeedProbeAt;
+    }
+
+    /** 记下"刚回探过"，把下次回探推到 {@link #SPACE_FEED_PROBE_INTERVAL_MS} 之后 */
+    private void markSpaceFeedProbed() {
+        nextSpaceFeedProbeAt = System.currentTimeMillis() + SPACE_FEED_PROBE_INTERVAL_MS;
+    }
+
+    /**
+     * 试拉一次空间动态（回探用）。
+     *
+     * <p>成功即视为"封禁已解除"，调用方会把数据源切回空间动态并直接复用本次结果。
+     * <b>失败不记入风控冷却</b>：这里本来就是"主动敲门"，敲不开是预期内的。
+     *
+     * @param uid 用哪个 UP 试（取本轮第一个订阅的 uid 即可）
+     * @return 拉到的动态列表；不可用时返回 {@code null}
+     */
+    private List<Dynamic.DynamicInfo> tryFetchSpaceFeed(Long uid) {
+        try {
+            List<Dynamic.DynamicInfo> list = new Dynamic().getDynamicInfoList(String.valueOf(uid));
+            log.info("回探 feed/space 成功 → 切回「空间动态」数据源（uid={}，{} 条）",
+                    uid, list == null ? 0 : list.size());
+            return list == null ? List.of() : list;
+        } catch (Throwable t) {
+            log.info("回探 feed/space 仍不可用（{}），继续用关注流，{} 分钟后再试",
+                    t.getMessage(), SPACE_FEED_PROBE_INTERVAL_MS / 60000);
+            return null;
+        }
+    }
+
+    /**
+     * 提示"被订阅但不在关注流里"的 UP。同一组缺失 uid 最多每 {@value #MISSING_UID_WARN_INTERVAL_MS}ms 提醒一次，
+     * 避免每轮刷屏。
+     *
+     * @param subscribed 本轮涉及的订阅 uid
+     * @param present    关注流里实际出现的 uid
+     */
+    private void warnUidsMissingFromFollowFeed(Set<Long> subscribed, Set<Long> present) {
+        List<Long> missing = new ArrayList<>();
+        for (Long uid : subscribed) {
+            if (!present.contains(uid)) {
+                missing.add(uid);
+            }
+        }
+        if (missing.isEmpty()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastMissingUidWarnAt < MISSING_UID_WARN_INTERVAL_MS) {
+            return;
+        }
+        lastMissingUidWarnAt = now;
+        log.warn("关注流里没有这些被订阅的 UP：{} —— 关注流只包含「该 B 站账号已关注」的 UP，"
+                + "若其中有没关注的，请用该账号去关注（否则这些订阅推不到）；"
+                + "已关注的 UP 只是最近没发动态时也会不出现，属正常。", missing);
+    }
+
+    /** 取第一个非空白字符串 */
+    private static String firstNonBlank(String a, String b) {
+        if (a != null && !a.isBlank()) {
+            return a;
+        }
+        return b != null && !b.isBlank() ? b : null;
+    }
+
+    /**
+     * 记录一次拉取失败：<b>只在第 1 次与每 10 次打完整堆栈</b>，其余打一行摘要。
+     *
+     * <p>原因见 {@link #failuresLogged}：风控持续期间（真机上实测可以连续几小时 100% 412）
+     * 每轮 20 行堆栈会把日志淹掉，反而看不到"出站身份""冷却中"这些真正能定位问题的行。
+     * 而"这一轮又失败了"本身的信息量，一行就够了。
+     *
+     * @param uid 失败的 UP uid
+     * @param e   异常
+     */
+    private void logFetchFailure(Long uid, Exception e) {
+        failuresLogged++;
+        String reason = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+        if (failuresLogged == 1 || failuresLogged % 10 == 0) {
+            log.error("获取动态列表失败（第 {} 次），本轮跳过 uid={}（该 uid 的其它订阅一并跳过）",
+                    failuresLogged, uid, e);
+        } else {
+            log.warn("获取动态列表失败（第 {} 次），本轮跳过 uid={}：{}", failuresLogged, uid, reason);
+        }
+    }
+
+    /**
+     * 进入风控冷却：连续失败时按 1 → 2 → 4 → 8 分钟递增（上限见 {@link #RISK_COOLDOWN_MAX_MS}）。
+     *
+     * <p>目的见 {@link #riskCooldownUntil} 的注释：一味按轮询间隔重试只会把 B 站的惩罚窗口
+     * 一轮一轮续期，越打越死；退避才能让窗口过期。
+     *
+     * <p>上限必须<b>小于</b> {@link #RECENT_MINUTES}：否则冷却期间发出的动态会"超龄"，
+     * 被 {@link #isFresh(String)} 判成不新鲜而永久漏推（这一点有注释约束，改参数时别只改一处）。
+     */
+    private void enterRiskCooldown() {
+        consecutiveFailures = Math.min(consecutiveFailures + 1, 16);
+        long delay = Math.min(RISK_COOLDOWN_BASE_MS << (consecutiveFailures - 1), RISK_COOLDOWN_MAX_MS);
+        riskCooldownUntil = System.currentTimeMillis() + delay;
+        log.warn("动态推送连续失败 {} 轮，冷却 {} 秒后再试（让 B 站惩罚窗口自然过期；"
+                        + "上限 {} 分钟，短于新鲜窗口 {} 分钟，所以不会因此漏推）",
+                consecutiveFailures, delay / 1000, RISK_COOLDOWN_MAX_MS / 60000, RECENT_MINUTES);
+    }
+
+    /**
+     * 这条动态对该订阅是否已经推过。
+     *
+     * @param pid         订阅 ID
+     * @param dynamicKey  动态 ID（转发动态用原动态 ID）
+     * @return true 表示已推过，应跳过
+     */
+    private boolean alreadyPushed(Long pid, String dynamicKey) {
+        Set<String> pushed = pushedDynamicIds.get(pid);
+        return pushed != null && pushed.contains(dynamicKey);
+    }
+
+    /**
+     * 记下"已推送"，供后续轮次去重。超出 {@link #PUSHED_HISTORY_PER_SUB} 时淘汰最旧的一条。
+     *
+     * @param pid        订阅 ID
+     * @param dynamicKey 动态 ID
+     */
+    private void markPushed(Long pid, String dynamicKey) {
+        Set<String> pushed = pushedDynamicIds.computeIfAbsent(pid, k -> new LinkedHashSet<>());
+        // 同一个 pid 只会被动态推送的一个线程访问（@Async + AtomicBoolean 重入闸），
+        // 但配置热更新等路径可能并读，所以这里对集合本身加锁，代价可忽略。
+        synchronized (pushed) {
+            if (pushed.size() >= PUSHED_HISTORY_PER_SUB) {
+                Iterator<String> it = pushed.iterator();
+                if (it.hasNext()) {
+                    it.next();
+                    it.remove();
+                }
+            }
+            pushed.add(dynamicKey);
+        }
+        // 只置脏标记，真正的落库在整轮结束时做一次（见 persistPushedIdsIfDirty）——
+        // 一轮里可能推多条（每个订阅一条），没必要每条都写一次库。
+        pushedStateDirty = true;
+    }
+
+    /**
+     * 启动时把去重记录从 {@code config} 表读回内存，并算出 {@link #coldStartPids}。
+     *
+     * <p>依赖 {@link LoadDSConfig} 已经完成自己的 {@code @PostConstruct}（读表进内存）——
+     * 这一点由 Spring 的依赖顺序保证：本类注入了 {@code LoadDSConfig}，
+     * 它必须先初始化完才会轮到本类。
+     */
+    @PostConstruct
+    public void loadPushedIds() {
+        String raw = loadDSConfig.getConfigMap().get(LoadDSConfig.KEY_PUSHED_DYNAMIC_IDS);
+        Map<Long, Set<String>> loaded = parsePushedIds(raw);
+        pushedDynamicIds.putAll(loaded);
+
+        for (PushInfo pushInfo : pushInfoMapper.selectList(null)) {
+            Long pid = pushInfo.getPid();
+            if (pid != null && !loaded.containsKey(pid)) {
+                coldStartPids.add(pid);
+            }
+        }
+
+        if (!loaded.isEmpty()) {
+            log.info("已载入动态推送去重记录：{} 个订阅、共 {} 条动态 ID（重启后不会重推这些）",
+                    loaded.size(), loaded.values().stream().mapToInt(Set::size).sum());
+        }
+        if (!coldStartPids.isEmpty()) {
+            log.info("订阅 {} 没有去重记录（本特性首次运行或记录被清空），本次启动只推送启动后新发布的动态，"
+                            + "不回补启动前 {} 分钟窗口内的旧动态",
+                    coldStartPids, RECENT_MINUTES);
+        }
+    }
+
+    /**
+     * 解析 {@code pid=id,id|pid=id,id} 形式的去重记录。
+     *
+     * <p>刻意不用 JSON：这条记录是"纯数字对纯数字"，自解析免掉一层序列化依赖，
+     * 出错时在库里直接肉眼可读、可手改。
+     *
+     * @param raw 库里的原始字符串，可为 null / 空白
+     * @return pid → 已推动态 ID；无法解析的片段会被跳过（宁可退化也不能因一条脏数据起不来）
+     */
+    private static Map<Long, Set<String>> parsePushedIds(String raw) {
+        Map<Long, Set<String>> result = new LinkedHashMap<>();
+        if (raw == null || raw.isBlank()) {
+            return result;
+        }
+        for (String entry : raw.split("\\|")) {
+            int eq = entry.indexOf('=');
+            if (eq <= 0) {
+                continue;
+            }
+            long pid;
+            try {
+                pid = Long.parseLong(entry.substring(0, eq).trim());
+            } catch (NumberFormatException e) {
+                continue;
+            }
+            Set<String> ids = new LinkedHashSet<>();
+            for (String id : entry.substring(eq + 1).split(",")) {
+                String value = id.trim();
+                if (!value.isEmpty()) {
+                    ids.add(value);
+                }
+            }
+            if (!ids.isEmpty()) {
+                result.put(pid, ids);
+            }
+        }
+        return result;
+    }
+
+    /** 把 {@link #pushedDynamicIds} 序列化成 {@link #parsePushedIds} 能读回来的字符串 */
+    private String serializePushedIds() {
+        StringBuilder sb = new StringBuilder();
+        pushedDynamicIds.forEach((pid, ids) -> {
+            if (ids.isEmpty()) {
+                return;
+            }
+            synchronized (ids) {
+                if (sb.length() > 0) {
+                    sb.append('|');
+                }
+                sb.append(pid).append('=').append(String.join(",", ids));
+            }
+        });
+        return sb.toString();
+    }
+
+    /**
+     * 把去重记录写回 {@code config} 表（仅在有变化时）。
+     *
+     * <p>写失败<b>不影响推送本身</b>——消息已经发出去了，最坏的后果只是重启后可能重推一次，
+     * 所以这里吞掉异常并保留脏标记，下一轮再试。
+     */
+    private void persistPushedIdsIfDirty() {
+        if (!pushedStateDirty) {
+            return;
+        }
+        pushedStateDirty = false;
+        try {
+            loadDSConfig.updateConfig(LoadDSConfig.KEY_PUSHED_DYNAMIC_IDS, serializePushedIds());
+        } catch (Throwable e) {
+            pushedStateDirty = true;
+            log.warn("保存动态推送去重记录失败（不影响本轮推送，重启后可能重复推一次）：{}", e.toString());
+        }
+    }
+
+    /**
+     * 这条动态是不是「本进程启动前就已发布」的积压（只在冷启动订阅上有意义）。
+     *
+     * <p>仅当 {@link #coldStartPids} 含该订阅时才可能为 true；判断依据是
+     * {@link #estimatePublishTimeMillis} 估算出的发布时刻早于 {@link #bootTimeMillis}。
+     */
+    private boolean isColdStartBacklog(Long pid, String time) {
+        return coldStartPids.contains(pid) && estimatePublishTimeMillis(time) < bootTimeMillis;
+    }
+
+    /**
+     * 从 B 站前端的相对时间文案反推发布时刻（毫秒）。
+     *
+     * <p>只需要处理 {@link #isFresh} 放行的两种文案（{@code 刚刚} / {@code N分钟前}）——
+     * 调用点都在 {@code isFresh} 之后，别的格式到不了这里。
+     *
+     * <p>「刚刚」取<b>整桶上界</b>（按 1 分钟前算）：它是约 1 分钟的模糊桶，
+     * 保守取值只会让冷启动时少推一条旧动态，不会造成重复推送 —— 这正是本方法存在的目的。
+     *
+     * @return 估算的发布时刻；完全认不出时返回 0（当作很久以前，冷启动时归为积压）
+     */
+    private static long estimatePublishTimeMillis(String time) {
+        if (time == null) {
+            return 0L;
+        }
+        if (time.startsWith("刚刚")) {
+            return System.currentTimeMillis() - 60_000L;
+        }
+        Matcher matcher = MINUTES_AGO.matcher(time);
+        if (matcher.find()) {
+            try {
+                return System.currentTimeMillis() - Long.parseLong(matcher.group(1)) * 60_000L;
+            } catch (NumberFormatException ignored) {
+                // 落回 0
+            }
+        }
+        return 0L;
+    }
+
+    /**
+     * 判断一条动态是否「足够新、值得推送」。
+     *
+     * <p>上游 {@code Dynamic.DynamicInfo.time} 是 B 站前端的相对时间文案（实测形如
+     * {@code 刚刚} / {@code 7小时前} / {@code 昨天 11:00 · 投稿了视频}）；「是不是新发的动态」
+     * 只能从这段文案里读 —— 这是 bilibili-api 与 XatiiBot 约定的触发依据
+     * （见 bilibili-api {@code REFACTOR_PLAN.md} §2.4）。
+     *
+     * <p>原来的判定写死 {@code startsWith("刚刚")}：「刚刚」窗口只有约 1 分钟，而本任务 60 秒
+     * 轮询一次，命中窗口极窄、容易漏推；上游文档也明确承认该文案尚未在真实新动态上验证过。
+     * 因此这里放宽为 <b>「刚刚」或「N 分钟前」且 N ≤ {@link #RECENT_MINUTES}</b>。
+     *
+     * <p><b>放宽不会造成重复推送</b>：{@link #pushedDynamicIds} 按订阅去重，同一个
+     * dynamicId 只推一次；放宽只是把「两次轮询之间被时间窗口甩掉的新动态」补回来。
+     * 若要恢复严格语义，把方法体改回 {@code time != null && time.startsWith("刚刚")} 即可。
+     */
+    private static boolean isFresh(String time) {
+        if (time == null || time.isEmpty()) {
+            return false;
+        }
+        if (time.startsWith("刚刚")) {
+            return true;
+        }
+        Matcher matcher = MINUTES_AGO.matcher(time);
+        if (matcher.find()) {
+            try {
+                return Integer.parseInt(matcher.group(1)) <= RECENT_MINUTES;
+            } catch (NumberFormatException ignored) {
+                return false;
+            }
+        }
+        return false;
     }
 
     /**
@@ -218,38 +953,85 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
      */
     private void sendMsg(String username,Dynamic dynamic,Dynamic.DynamicInfo dynamicInfo,Bot bot,PushInfo pushInfo) throws InterruptedException, IOException {
         String sendMsg = "";
+        BilibiliClient bilibiliClient = new BilibiliClient();
+        // 注意：下面三段必须互斥（else if）。原来写成三个独立 if 时是**顺序覆盖**：
+        // 视频类动态 bvid 与 dynamicId 同时非空，最后一段会把刚拼好的「投稿了视频」卡片
+        // 整段覆盖掉 —— 那段代码等于死代码，封面也永远发不出去。
+        // 优先级：视频投稿 > 转发 > 图文/opus。
         if (dynamicInfo.getBvid() != null){
-            sendMsg = MsgUtils.builder().text(username + " 投稿了视频\n")
-                    .img(new BilibiliClient().getVideoCoverUrl(dynamicInfo.getBvid()))
-                    .text("av"+new BilibiliClient().getVideoAv(dynamicInfo.getBvid())+"\n"+dynamicInfo.getBvid()+
-                          "标题："+  new BilibiliClient().getVideoTitle(dynamicInfo.getBvid())+"\n"+
-                          "简介："+ new BilibiliClient().getVideoDesc(dynamicInfo.getBvid())+"\n\n"+
+            // 封面**本地下载后转 base64** 再发，不把 URL 丢给 NapCat：
+            // B 站图床（i0/i2.hdslb.com）对不带 Referer 的请求常返 403，而 NapCat 那侧的网络
+            // 环境不归我们管。下载失败（urlToBase64 返回 null）就降级成纯文字，
+            // 不因为一张封面把整条动态推送丢掉。
+            String coverBase64 = BiliBiliContant.urlToBase64(bilibiliClient.getVideoCoverUrl(dynamicInfo.getBvid()));
+            MsgUtils builder = MsgUtils.builder().text(username + " 投稿了视频\n");
+            if (coverBase64 != null) {
+                builder = builder.img("base64://" + coverBase64);
+            }
+            sendMsg = builder
+                    .text("av"+bilibiliClient.getVideoAv(dynamicInfo.getBvid())+"\n"+dynamicInfo.getBvid()+
+                          "标题："+  bilibiliClient.getVideoTitle(dynamicInfo.getBvid())+"\n"+
+                          "简介："+ bilibiliClient.getVideoDesc(dynamicInfo.getBvid())+"\n\n"+
                           "https://www.bilibili.com/video/"+dynamicInfo.getBvid()
                     ).build();
-        }
-        String dynamicId = dynamicInfo.getDynamicId()==null?dynamicInfo.getShareDynamicId()==null?new Date().toString():dynamicInfo.getShareDynamicId():dynamicInfo.getDynamicId();
-        if (dynamicInfo.getShareDynamicId()!= null){
-            BufferedImage dynamicImg = dynamic.getDynamicImg(dynamicInfo.getShareDynamicId());
-            if (Objects.isNull(dynamicImg)){
-                return;
+        } else if (dynamicInfo.getShareDynamicId()!= null){
+            // 转发动态：长图渲染失败时**降级成纯文字**，而不是整条丢掉
+            // （原实现是 `return`，等于渲染一出问题这条推送就永远收不到）
+            String base64Image = renderDynamicImage(dynamic, dynamicInfo.getShareDynamicId(), "转发动态");
+            MsgUtils builder = MsgUtils.builder().text(username + " 转发了动态\n原动态：\n");
+            if (base64Image != null) {
+                builder = builder.img("base64://" + base64Image);
             }
-            String base64Image = BiliBiliContant.imgToBase64(dynamicImg);
-            sendMsg = MsgUtils.builder().text(username + " 转发了动态\n原动态：\n")
-                    .img("base64://"+base64Image).build();
-        }
-
-        if (dynamicInfo.getDynamicId()!=null) {
-            BufferedImage dynamicImg = dynamic.getDynamicImg(dynamicId);
-            if (Objects.isNull(dynamicImg)){
-                return;
+            sendMsg = builder.build();
+        } else if (dynamicInfo.getDynamicId()!=null) {
+            String base64Image = renderDynamicImage(dynamic, dynamicInfo.getDynamicId(), "动态");
+            MsgUtils builder = MsgUtils.builder().text(username+"发表了动态");
+            if (base64Image != null) {
+                builder = builder.img("base64://" + base64Image);
             }
-            String base64Image = BiliBiliContant.imgToBase64(dynamicImg);
-            sendMsg = MsgUtils.builder().text(username+"发表了动态")
-                    .img("base64://"+base64Image)
+            sendMsg = builder
                     .text("https://www.bilibili.com/opus/"+dynamicInfo.getDynamicId())
                     .build();
         }
+        if (sendMsg.isEmpty()) {
+            log.warn("动态解析不出可推送的正文（bvid/dynamicId/shareDynamicId 全为空），跳过：{}",
+                    dynamicInfo);
+            return;
+        }
         sendMessage(bot, pushInfo, sendMsg);
+    }
+
+    /**
+     * 渲染动态长图并转成 base64；<b>任何失败都返回 {@code null}</b>，由调用方降级为纯文字。
+     *
+     * <p><b>为什么这里必须兜 {@link Throwable} 而不是 {@link Exception}</b>（2026-09-14 真机踩到）：
+     * 在一台没有任何字体、也没装 fontconfig 的 Debian 上，Java2D 初始化字体管理器时抛的是
+     * <b>{@code java.lang.InternalError: ... Fontconfig head is null}</b> —— 它是 {@link Error}
+     * 而不是 {@link Exception}。只要有一层是 {@code catch (Exception)}，它就一路穿出去，
+     * 整轮动态推送在「发消息」之前就中断了：日志里只有一条 AsyncUncaughtExceptionHandler，
+     * <b>用户什么都收不到</b>。
+     *
+     * @param dynamic   动态门面
+     * @param dynamicId 动态 ID
+     * @param what      用于日志的动宾短语（如「动态」「转发动态」）
+     * @return base64 字符串；渲染不可用时为 {@code null}
+     */
+    private String renderDynamicImage(Dynamic dynamic, String dynamicId, String what) {
+        try {
+            BufferedImage image = dynamic.getDynamicImg(dynamicId);
+            if (image == null) {
+                log.warn("{}长图渲染返回空，改为只发文字：dynamicId={}", what, dynamicId);
+                return null;
+            }
+            return BiliBiliContant.imgToBase64(image);
+        } catch (Throwable t) {
+            // 不把堆栈打进日志（可能每轮都出现会刷屏），但把「怎么修」写进文案
+            log.error("{}长图渲染失败，改为只发文字：dynamicId={}，原因={}。"
+                            + "若原因是 \"Fontconfig head is null\"，说明跑机器人的系统缺少字体/fontconfig，"
+                            + "在 Linux 上执行 `apt-get install -y fontconfig fonts-dejavu-core` 即可",
+                    what, dynamicId, t.toString());
+            return null;
+        }
     }
 
     /**
@@ -450,27 +1232,11 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
         return pushInfo;
     }
 
+    /**
+     * 鉴权：规则本体在 {@link BotAdminChecker}（与 Cookie 配置命令共用一份，避免两处逻辑漂移）。
+     */
     private boolean isNotAdmin(AnyMessageEvent event){
-        if (Objects.isNull(event.getGroupId())){
-            return false;
-        }
-        if (event.getSender().getRole().equals("owner")|| event.getSender().getRole().equals("admin")){
-            return false;
-        }
-        Long userId = event.getUserId();
-        Long groupId = event.getGroupId();
-        LambdaQueryWrapper<Admin> queryWrapper = new LambdaQueryWrapper<>();
-        queryWrapper.eq(Admin::getQqUid, userId);
-        List<Admin> list = adminService.list(queryWrapper);
-        for (Admin admin : list) {
-            if (Objects.isNull(admin.getGroupId())){
-                return false;
-            }
-            if (admin.getGroupId().equals(groupId)){
-                return false;
-            }
-        }
-        return true;
+        return !botAdminChecker.isAdmin(event);
     }
 
     private boolean isGroupAdmin(Bot bot,Long groupId){
