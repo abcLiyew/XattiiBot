@@ -4,7 +4,7 @@ import com.baomidou.mybatisplus.annotation.IdType;
 import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;
-import com.esdllm.config.CustomDateTypeHandler;
+import com.esdllm.config.LongListTypeHandler;
 import lombok.Data;
 import lombok.experimental.Accessors;
 
@@ -47,7 +47,7 @@ public class PushInfo {
     /**
      * at 列表
      */
-    @TableField(typeHandler = CustomDateTypeHandler.class)
+    @TableField(typeHandler = LongListTypeHandler.class)
     private List<Long> atList = List.of(0L);
 
     /**

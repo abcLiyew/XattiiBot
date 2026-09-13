@@ -19,6 +19,7 @@ import com.mikuac.shiro.dto.action.common.ActionData;
 import com.mikuac.shiro.dto.action.response.GroupMemberInfoResp;
 import com.mikuac.shiro.dto.event.message.AnyMessageEvent;
 import jakarta.annotation.Resource;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.stereotype.Service;
 
@@ -26,6 +27,8 @@ import java.awt.image.BufferedImage;
 import java.io.IOException;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.util.Date;
 import java.util.List;
 import java.util.Objects;
@@ -36,6 +39,7 @@ import java.util.Objects;
 * @createDate 2025-04-22 23:58:21
 */
 @Service
+@Slf4j
 public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
     implements PushInfoService{
     private static final ThreadLocal<SimpleDateFormat> SAFE_DATE_FORMAT =
@@ -338,7 +342,7 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
                 .text(" " + userName + " 开播了" +
                         "\n标题：" + liveRoom.getLiveTitle(roomId) + "\n" +
                         "分区：" + liveRoom.getLiveArea(roomId) + "\n" +
-                        "地址：" + liveRoom.getLiveUrl(roomId) + "\n" +
+                        "地址：" + liveRoom.getLiveUrl(roomId) +"?live_from="+(int)(Math.random()*10000)+"&spm_id_from=333.1007.top_right_bar_window_dynamic.content.click"+ "\n" +
                         "[CQ:image,file=" + liveRoom.getImageUrl(roomId) + "]")
                 .build();
     }
@@ -347,8 +351,8 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
      * 构建下播消息
      */
     private String buildLiveEndMessage(PushInfo pushInfo, String userName) {
-        Date now = new Date();
-        long between = now.getTime() - pushInfo.getLiveTime();
+        long now = System.currentTimeMillis();
+        long between = now - pushInfo.getLiveTime();
         long hour = (between / (60 * 60 * 1000));
         long minute = ((between / (60 * 1000)) % 60);
         long second = ((between / 1000) % 60);

@@ -10,7 +10,7 @@
             <result property="groupId" column="group_id" />
             <result property="qqUid" column="qq_uid" />
             <result property="atAll" column="at_all" />
-            <result property="atList" column="at_list" typeHandler="com.esdllm.config.CustomDateTypeHandler" />
+            <result property="atList" column="at_list" typeHandler="com.esdllm.config.LongListTypeHandler" />
             <result property="liveStatus" column="live_status" />
             <result property="liveTime" column="live_time" />
             <result property="livePush" column="live_push" />

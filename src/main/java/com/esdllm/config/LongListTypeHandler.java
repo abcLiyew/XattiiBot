@@ -12,7 +12,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 @Component
-public class CustomDateTypeHandler extends BaseTypeHandler<List<Long>> {
+public class LongListTypeHandler extends BaseTypeHandler<List<Long>> {
     @Override
     public void setNonNullParameter(PreparedStatement ps, int i, List<Long> parameter, JdbcType jdbcType) throws SQLException {
         ps.setObject(i, parameter);

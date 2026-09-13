@@ -22,22 +22,25 @@ import java.util.Objects;
 @Service
 public class SignInRecordsServiceImpl extends ServiceImpl<SignInRecordsMapper, SignInRecords>
     implements SignInRecordsService{
-    SignInInfo signInInfo = new SignInInfo();
     @Override
     public SignInInfo isSign(Long qqUid, Long groupId) {
         LambdaQueryWrapper<SignInRecords> queryWrapper = new LambdaQueryWrapper<>();
         queryWrapper.eq(SignInRecords::getQqUid,qqUid);
         if (!Objects.isNull(groupId)){
             queryWrapper.eq(SignInRecords::getGroupId,groupId);
+        }else {
+            queryWrapper.isNull(SignInRecords::getGroupId);
         }
         SignInRecords signInRecords = this.getOne(queryWrapper);
-        if (sign(signInRecords,qqUid,groupId)) {
+        // 每次调用独立创建返回对象，避免单例 Service 的实例字段被多线程共享
+        SignInInfo signInInfo = new SignInInfo();
+        if (sign(signInInfo, signInRecords, qqUid, groupId)) {
             return signInInfo;
         }
         return null;
     }
 
-    private boolean sign(SignInRecords signInRecords, Long qqUid,Long groupId){
+    private boolean sign(SignInInfo signInInfo, SignInRecords signInRecords, Long qqUid,Long groupId){
         if (todaySigned(signInRecords)){
             signInInfo.setIsSign(false);
             return true;

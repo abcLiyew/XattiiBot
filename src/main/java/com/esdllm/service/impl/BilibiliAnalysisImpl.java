@@ -186,11 +186,17 @@ public class BilibiliAnalysisImpl implements BilibiliAnalysis {
         if (staff==null||staff.isEmpty()){
             return "";
         }
-        String str = "合作up主：";
+        final String prefix = "合作up主：";
+        StringBuilder str = new StringBuilder(prefix);
         for (Staff s : staff){
-            str = s.getName()+",";
+            if (s==null||s.getName()==null){
+                continue;
+            }
+            str.append(s.getName()).append(",");
         }
-        str = str.substring(0,str.length()-1);
-        return str;
+        if (str.length()==prefix.length()){
+            return "";
+        }
+        return str.substring(0,str.length()-1);
     }
 }

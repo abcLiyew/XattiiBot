@@ -113,7 +113,7 @@ public class BiliBiliPushPlugins {
     }
 
     @Async
-    @Scheduled(fixedRate = 40000)
+    //@Scheduled(fixedRate = 40000)
     public void dynamicPush() throws InterruptedException {
         long startTime = System.currentTimeMillis();
         Bot bot = getBotFromConfig();

@@ -4,6 +4,7 @@ server:
 
 shiro:
   ws:
+    access-token: "${SHIRO_ACCESS_TOKEN:}"
     server:
       enable: false
       url: "/ws/demo"
@@ -23,12 +24,12 @@ spring:
       primary: sqlite
       datasource:
         sqlite:
-          url: jdbc:sqlite:resources/xatiiBot.db
+          url: jdbc:sqlite:./resources/xatiiBot.db
           driver-class-name: org.sqlite.JDBC
         mysql:
-          url: jdbc:mysql:///xatiiBot
+          url: jdbc:mysql://esdllm.top:3306/napcatbot
           username: root
-          password: 152773652
+          password: ${MYSQL_PASSWORD:}
           driver-class-name: com.mysql.cj.jdbc.Driver
 
 mybatis-plus:
@@ -41,5 +42,6 @@ mybatis-plus:
       table-prefix:  # 设置表的前缀
   configuration:
     map-underscore-to-camel-case: true #开启驼峰命名
+    #log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
   type-handlers-package: com.esdllm.config
 

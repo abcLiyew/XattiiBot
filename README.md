@@ -6,8 +6,10 @@ XatiiBot 是一个基于 Java 开发的 QQ 机器人，主要用于解析和分�
 - 直播解析 ：解析 Bilibili 直播间链接，显示直播间标题、主播信息、观看人数等
 - 动态解析 ：解析 Bilibili 动态链接，显示动态内容和发布者信息
 - 短链接解析 ：支持解析 b23.tv 短链接
+- 直播 / 动态订阅推送 ：为指定 B 站房间添加订阅，开播、下播、投稿与动态自动推送到群聊或私聊
+- 群签到养成 ：群内提供「签到 / 查询 / 今日运势」互动，累计好感度并划分等级与态度
 ## 技术栈
-- Spring Boot 3.4.4 ：作为应用程序的基础框架
+- Spring Boot 3.5.7 ：作为应用程序的基础框架
 - MyBatis-Plus ：用于数据库操作的增强工具
 - Shiro ：QQ 机器人框架，用于处理消息事件
 - Bilibili-API ：用于与 Bilibili 平台交互的 API 库
@@ -19,7 +21,7 @@ XatiiBot 是一个基于 Java 开发的 QQ 机器人，主要用于解析和分�
 < dependency >
     < groupId > com.esdllm </ groupId >
    < artifactId > bilibili-api </ artifactId >
-   < version > 0.9.13.1-beta </ version >
+   < version > 0.9.13.3-beta </ version >
 </ dependency >
 
 <!-- 数据库相关依赖 -->
@@ -62,9 +64,15 @@ XatiiBot 是一个基于 Java 开发的 QQ 机器人，主要用于解析和分�
 ## 项目结构
 项目主要包含以下组件：
 
-- BilibiliAnalysisPlugin ：处理消息事件，识别并提取 Bilibili 链接
-- BilibiliAnalysisImpl ：实现 Bilibili 内容解析的核心逻辑
+- BilibiliAnalysisPlugin ：识别消息中的 Bilibili 链接，并分发给解析服务
+- BilibiliAnalysisImpl ：Bilibili 视频、直播、动态内容解析的核心实现
+- BiliBiliPushPlugins ：处理「添加订阅 / 取消订阅」指令，并定时推送开播、下播与投稿动态
+- SignInPlugins ：处理「签到 / 查询 / 今日运势」指令，维护群内好感度
+- PushInfoServiceImpl ：订阅的增删与推送逻辑，含管理员鉴权
+- SignInRecordsServiceImpl ：签到数据读写与好感度结算
+- LoadDSConfig ：启动时从数据库加载运行时配置，支持热更新
 - AdminService/AdminMapper ：处理管理员相关的数据库操作
+- mapper/* 与 resources/mapper/*.xml ：MyBatis-Plus 数据访问层
 ## 使用方法
 1. 确保已安装 Java 17 或更高版本
 2. 配置数据库连接
