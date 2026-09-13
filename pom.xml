@@ -14,6 +14,22 @@
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
             </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <!-- JDK 23 起 javac 不再从 classpath 自动发现注解处理器，
+                         必须显式声明 Lombok，否则 @Slf4j/@Data/@Getter 等全部失效，
+                         编译时报大量“找不到符号” -->
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                            <version>${lombok.version}</version>
+                        </path>
+                    </annotationProcessorPaths>
+                </configuration>
+            </plugin>
         </plugins>
     </build>
 
@@ -27,14 +43,26 @@
         <maven.compiler.source>17</maven.compiler.source>
         <maven.compiler.target>17</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <!-- 与 spring-boot 3.5.7 管理的版本保持一致，显式声明以便本工程独立可编译 -->
+        <lombok.version>1.18.42</lombok.version>
     </properties>
 
     <dependencies>
         <dependency>
             <groupId>com.esdllm</groupId>
             <artifactId>bilibili-api</artifactId>
-            <version>0.9.13.3-beta</version>
+            <version>0.9.20-beta</version>
         </dependency>
+
+        <!-- Lombok：bilibili-api 0.9.20-beta 起把 lombok 声明为 provided（不向下游传递），
+             本工程必须自己声明，否则 import lombok.* 无法解析 -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <version>${lombok.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
         <!-- SQLite JDBC Driver -->
         <dependency>
             <groupId>org.xerial</groupId>
