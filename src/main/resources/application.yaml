@@ -4,6 +4,9 @@ server:
 
 shiro:
   ws:
+    # 🔴 明文已从仓库移除：原值曾随 6 个提交提交并 push 到**公开**仓库，按已泄漏处理，请更换。
+    #    取值优先级：命令行参数 > 环境变量 SHIRO_ACCESS_TOKEN > 这里的空串。
+    #    线上 start.sh 本来就是用命令行传的（--shiro.ws.access-token=...），不受影响。
     access-token: "${SHIRO_ACCESS_TOKEN:}"
     server:
       enable: false
@@ -22,6 +25,16 @@ spring:
 
     dynamic:
       primary: sqlite
+      # 延迟初始化：不在启动时创建数据源，第一次真正被用到才建。
+      # 这里是为 mysql 数据源加的 —— 它是历史迁移残留（DataPortability 的 @PostConstruct
+      # 已被注释掉、全项目无人调用它），却在每次启动时被初始化一遍。
+      # 实测（temp/_probe_mysql_pw.py，2026-10-03）：加上本项后启动日志里不再出现
+      # `{dataSource-N,mysql} inited`，启动正常。
+      # ⚠️ 不加也能启动 —— Druid 的 initialSize 默认为 0，光 init() 不会建真实连接，
+      #    所以密码为空时不会在启动阶段炸（这条也实测过）。加它是因为"没人用的池子不该建"，
+      #    并且能让"真要访问 mysql 时"的报错点落在使用处而不是启动处。
+      lazy: true
+
       # ── Druid 全局参数：sqlite / mysql 都会继承，数据源自己写了则覆盖自己那份 ──
       #
       # 这里的 key 形状有讲究，别照着别的教程写。依据（已核实 dynamic-datasource 4.3.1 源码）：
@@ -48,9 +61,20 @@ spring:
         sqlite:
           url: jdbc:sqlite:./resources/xatiiBot.db
           driver-class-name: org.sqlite.JDBC
+        # ⚠️ 历史数据迁移源：DataPortability 的 @PostConstruct 已被注释掉、全项目无人调用它，
+        #    但配置留着（将来要再迁一次还用得上，见上面 lazy 那段）。
         mysql:
           url: jdbc:mysql://esdllm.top:3306/napcatbot
           username: root
+          # 🔴 密码不再进仓库：原值曾明文提交并 push 到**公开**仓库 ⇒ 按已泄漏处理，请去 MySQL 改掉。
+          #    换密码**不影响线上 bot** —— 这个数据源没人用，加上上面配了 dynamic.lazy，
+          #    它根本不会被真正连接（实测启动日志里已无 mysql inited）。
+          #
+          # 怎么给（优先级从高到低）：
+          #   ① 命令行参数（线上 start.sh 用这个）：
+          #        --spring.datasource.dynamic.datasource.mysql.password=xxx
+          #   ② 环境变量：MYSQL_PASSWORD=xxx
+          #   ③ 不写 = 空串（默认；一样能启动，只有真要跑 mysql 迁移时才会连接失败）
           password: ${MYSQL_PASSWORD:}
           driver-class-name: com.mysql.cj.jdbc.Driver
 
