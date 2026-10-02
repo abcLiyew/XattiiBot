@@ -1,5 +1,14 @@
 # XatiiBot
+
 XatiiBot 是一个基于 Java 开发的 QQ 机器人，主要用于解析和分析 Bilibili 平台的内容，包括视频、直播和动态。该机器人能够自动识别聊天中的 Bilibili 链接，并返回相关内容的详细信息。
+
+[![release](https://img.shields.io/github/v/release/abcLiyew/XattiiBot?include_prereleases&sort=semver)](https://github.com/abcLiyew/XattiiBot/releases)
+[![license](https://img.shields.io/github/license/abcLiyew/XattiiBot)](LICENSE)
+[![java](https://img.shields.io/badge/JDK-17%2B-orange)](https://adoptium.net/)
+
+> 📦 **下载**：到 [**Releases**](https://github.com/abcLiyew/XattiiBot/releases) 取 `XatiiBot-<版本>.jar`，
+> **直接 `java -jar` 就能跑** —— 数据库、表、索引会在首次启动时自动建好，不需要预先准备任何东西。
+> 详见下方[「使用方法」](#使用方法)。
 
 ## 功能特点
 - 视频解析 ：解析 Bilibili 视频链接，显示视频标题、简介、播放量、点赞数等信息
@@ -79,6 +88,8 @@ XatiiBot 是一个基于 Java 开发的 QQ 机器人，主要用于解析和分�
 - BiliBiliPushPlugins ：处理「添加订阅 / 取消订阅」指令，并定时推送开播、下播与投稿动态
 - BiliConfigPlugins ：处理「设置cookie / cookie状态 / 清除cookie」「设置代理 / 代理状态 / 清除代理」与「开关」指令，管理动态推送所需的 B 站登录凭据、出口与功能开关
 - BiliLoginPlugins ：处理「登录」扫码登录（仅机器人所有者、仅私聊）与「登录状态」查询
+- QrCodeUtils ：把登录二维码渲染成 PNG base64
+- CookieUtils ：Cookie 解析与合并的**唯一口径**（扫码登录、手工配置两条写入路径共用）
 - BiliSearchPlugins ：处理「搜视频 / 热搜 / 今日热门」三条只读查询指令
 - CredentialGuard ：B 站凭据探测与缓存的统一入口（事件驱动 + 定时兜底）
 - SignInPlugins ：处理「签到 / 查询 / 今日运势」指令，维护群内好感度
@@ -86,8 +97,13 @@ XatiiBot 是一个基于 Java 开发的 QQ 机器人，主要用于解析和分�
 - SignInRecordsServiceImpl ：签到数据读写与好感度结算
 - BotAdminChecker ：统一的管理权限判定（订阅、Cookie 配置等敏感操作共用一份规则）
 - LoadDSConfig ：启动时从数据库加载运行时配置，支持热更新
+- DbInitializer ：启动时（**任何 bean 实例化之前**）执行 `schema/<数据源名>.sql` ——
+  补建库文件目录、建表、补缺列、建索引。这是「`java -jar` 开箱即用」的实现
 - AdminService/AdminMapper ：处理管理员相关的数据库操作
 - mapper/* 与 resources/mapper/*.xml ：MyBatis-Plus 数据访问层
+- resources/schema/sqlite.sql ：SQLite 的建表 / 补列 / 建索引脚本，由 `DbInitializer` 在启动时执行。
+  只允许写 `CREATE ... IF NOT EXISTS` 和 `ALTER TABLE ADD COLUMN`（脚本每次启动都跑，所以禁止 DROP/DELETE/UPDATE）；
+  **给已有的表加列 = 直接改这里的 `CREATE TABLE` 语句**，期望列是从它解析出来的，不用另外维护列清单
 
 ## 可选功能开关（config 表）
 
@@ -144,16 +160,62 @@ INSERT INTO config(key, value) VALUES ('biliAnalysisWithSummary', 'true');
 开关状态可在启动日志、改配置时的回显、或直接发「开关」命令确认（AI 摘要那项还会额外报一句 Cookie 有没有配）。
 
 ## 使用方法
-1. 确保已安装 Java 17 或更高版本
-2. 配置数据库连接
-3. 构建并运行项目：
+
+### 方式一：直接用 Release 里的 jar（推荐）
+
+1. **装 JDK 17 或更高版本**：
    ```bash
-   
-   mvn clean package
-   
-   java -jar target/XatiiBot-2.0.1-beta.jar
+   java -version
    ```
-4. 将机器人添加到 QQ 群中，当有人发送 Bilibili 链接时，机器人会自动解析并回复相关信息
+   ⚠️ 项目按 **Java 17** 编译（`maven.compiler.release=17`）。17 编出来的在 21/25 上能跑，
+   反过来不行 —— 所以别低于 17。
+
+2. **下载 jar**：[Releases](https://github.com/abcLiyew/XattiiBot/releases) → `XatiiBot-<版本>.jar`。
+
+3. **直接启动，不需要预先准备任何东西**：
+   ```bash
+   java -jar XatiiBot-<版本>.jar
+   ```
+   首次启动会自动做完这些：
+   - 建好 `./resources/` 目录和 `./resources/xatiiBot.db`（SQLite，**不用单独装数据库**）；
+   - 建 4 张表（`admin` / `config` / `push_info` / `sign_in_records`）并建好索引；
+   - 日志写到 `./logs/xatiiBot.log`（全量）和 `./logs/xatiiBot-error.log`（只 WARN/ERROR）。
+
+   之后再启动是**幂等**的：只补缺的表、缺的列，**不碰已有数据**。
+
+   ⚠️ **要在有写权限的目录里启动** —— 库、日志、临时图都是按「当前工作目录」找相对路径的。
+   想换位置就改 `application.yaml` 里的 `spring.datasource.dynamic.datasource.sqlite.url`。
+
+4. **接上 NapCat / OneBot v11**：机器人开 `2233` 端口，默认去连 `ws://127.0.0.1:3001`。
+   端口和口令来自 `application.yaml` 的 `server.port` / `shiro.ws.*`，也可以命令行覆盖（优先级最高）：
+   ```bash
+   java -jar XatiiBot-<版本>.jar \
+     --shiro.ws.client.url=ws://127.0.0.1:3001 \
+     --shiro.ws.access-token=<你的 token>
+   ```
+
+5. **配 B 站 Cookie**（**只影响动态推送**；不配也能用链接解析、订阅、签到）：
+   私聊机器人发「登录」扫码即可 —— 见下方「配置 B 站 Cookie」一节。
+
+6. 把机器人拉进群 —— 有人发 B 站链接就会自动解析。
+
+> Linux 上还要装 fontconfig，否则动态推送的图渲染不出来（通知不会丢，会降级成纯文字）：
+> 见下方「⚠️ Linux 部署必装：字体」一节。
+
+### 方式二：自己构建
+
+```bash
+mvn clean package                       # 产物：target/XatiiBot-<版本>.jar
+java -jar target/XatiiBot-<版本>.jar
+```
+
+构建要点（都是踩过的坑）：
+- 依赖里有一个**私有库** `com.esdllm:bilibili-api`（不在 Maven Central）—— 构建前得先能拿到它，
+  见下方「Bilibili-API」一节；
+- **用 JDK 17**；
+- **Lombok 必须 ≥ 1.18.42**（1.18.34 在 JDK 25 上会抛 `ExceptionInInitializerError`），
+  且 `pom.xml` 里要显式配 `maven-compiler-plugin` 的 `<annotationProcessorPaths>`
+  —— JDK 23 起 javac 不再从 classpath 自动发现注解处理器，不配就整片「找不到符号」。
 
 ## ⚠️ Linux 部署必装：字体（否则动态推送的图发不出来）
 
