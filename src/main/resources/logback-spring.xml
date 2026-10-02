@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  XatiiBot 日志配置（2026-10-02）
+
+  ## 为什么用 XML 而不是 application.yaml 的 logging.* 属性
+    属性方式只能配「一个」文件，做不到「全量日志 + 错误日志」按级别分流到两个文件。
+    分流需要两个 appender 各挂 ThresholdFilter，只能在 XML 里做。
+    ⚠️ 一旦存在本文件，Spring Boot 就不再创建它内置的 file appender，
+       所以 application.yaml 里写的 logging.logback.rollingpolicy.* 会被**静默忽略**
+       —— 那边已经删干净了，别再加回去。
+
+  ## 产出（都在工作目录下的 logs/，即 XattiiBot/logs/）
+    xatiiBot.log          ← 全量（INFO 及以上）
+    xatiiBot-error.log    ← 只收 WARN / ERROR。排查时直接看这个，
+                            不用在几万行 INFO 里翻——尤其动态推送风控时会疯狂刷 INFO。
+    两者都：按天滚动 + 单文件 100MB 兜底（曾出现单日风控刷屏 20MB+），保留 30 天，总量封顶。
+
+  ## ⚠️ 「按天」判定用的是 JVM 时区
+    启动参数带了 -Duser.timezone=Asia/Shanghai，所以滚动出的文件名日期
+    与日志内容里的时间戳（+08:00）**一致**。
+    （注意：服务器**系统时间是 UTC**，`ls` 看到的时间戳会比北京时间早 8 小时，别被误导。）
+
+  ## ⚠️ 依赖 logs/ 目录已存在
+    logback 的 RollingFileAppender 不会自动建父目录，所以 start.sh 里有 mkdir -p logs。
+    手动 `java -jar` 跑之前记得先建目录，否则日志静默丢失（只会在控制台看到一句警告）。
+-->
+<configuration>
+
+    <!-- 拿 Spring Boot 的标准件：conversionRule、FILE_LOG_PATTERN、CONSOLE appender 等 -->
+    <include resource="org/springframework/boot/logging/logback/defaults.xml"/>
+    <include resource="org/springframework/boot/logging/logback/console-appender.xml"/>
+
+    <!-- 变量名刻意避开 LOG_FILE / LOG_PATH —— 那两个在 defaults.xml 里已有定义（local scope 优先级更高），
+         同名会被覆盖掉，用 LOG_ALL / LOG_ERR 更保险。 -->
+    <property name="LOG_DIR" value="logs"/>
+    <property name="LOG_ALL" value="${LOG_DIR}/xatiiBot.log"/>
+    <property name="LOG_ERR" value="${LOG_DIR}/xatiiBot-error.log"/>
+
+    <!-- ==================== ① 全量日志（INFO 及以上） ==================== -->
+    <appender name="FILE_ALL" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_ALL}</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_ALL}.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
+            <maxFileSize>100MB</maxFileSize>
+            <maxHistory>30</maxHistory>
+            <totalSizeCap>3GB</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>${FILE_LOG_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- ==================== ② 错误日志（WARN 及以上） ==================== -->
+    <!-- ThresholdFilter 设 WARN ⇒ 只放行 WARN/ERROR，INFO/DEBUG/TRACE 整条丢弃 -->
+    <appender name="FILE_ERR" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_ERR}</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_ERR}.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
+            <maxFileSize>100MB</maxFileSize>
+            <maxHistory>30</maxHistory>
+            <totalSizeCap>1GB</totalSizeCap>
+        </rollingPolicy>
+        <filter class="ch.qos.logback.classic.filter.ThresholdFilter">
+            <level>WARN</level>
+        </filter>
+        <encoder>
+            <pattern>${FILE_LOG_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- CONSOLE 留着是为了前台/IDE 里调试能直接看到；
+         生产是 nohup 起的，start.sh 把 stdout 丢了 /dev/null，所以不会重复落盘。 -->
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+        <appender-ref ref="FILE_ALL"/>
+        <appender-ref ref="FILE_ERR"/>
+    </root>
+
+</configuration>

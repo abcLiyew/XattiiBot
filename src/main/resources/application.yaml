@@ -22,6 +22,28 @@ spring:
 
     dynamic:
       primary: sqlite
+      # ── Druid 全局参数：sqlite / mysql 都会继承，数据源自己写了则覆盖自己那份 ──
+      #
+      # 这里的 key 形状有讲究，别照着别的教程写。依据（已核实 dynamic-datasource 4.3.1 源码）：
+      #   DruidDataSourceCreator#createDataSource 里先
+      #       DruidConfigUtil.merge(全局 gConfig, 本数据源的 config)
+      #   —— merge 的合并方向是「本数据源为 null 时取全局」（见 mergeBasic），
+      #   随后 toProperties() 输出 `druid.validationQuery` 这种带前缀的 key，
+      #   交给 DruidDataSource#configFromPropeties 接收。
+      #   ⇒ 所以写在 dynamic.druid 下即可全局生效，**不必**在两个数据源里各写一遍。
+      #
+      # 为什么必须显式配 validation-query：
+      #   ① Druid 的 testWhileIdle **默认就是 true**（空闲连接会被周期性探活），
+      #      但探活语句默认没配 ⇒ 启动时 init() 直接打一条 ERROR：
+      #          testWhileIdle is true, validationQuery not set
+      #   ② 比"多一条 ERROR"更要紧的是：没语句 ⇒ 探活**实际根本没执行**。
+      #      看着像开了保活，其实空闲连接一次都没被校验过；远程 MySQL 的连接被防火墙/
+      #      中间设备静默掐断后，下次取用必抛 Communications link failure，
+      #      而报错点离真因很远（是取连接时炸，不是配置时炸）。
+      #   SELECT 1 两个库都吃（SQLite 与 MySQL 均支持，MySQL 不需要 FROM DUAL），
+      #   故一条全局的足够。
+      druid:
+        validation-query: SELECT 1
       datasource:
         sqlite:
           url: jdbc:sqlite:./resources/xatiiBot.db
@@ -31,6 +53,29 @@ spring:
           username: root
           password: ${MYSQL_PASSWORD:}
           driver-class-name: com.mysql.cj.jdbc.Driver
+
+# 日志配置见 src/main/resources/logback-spring.xml
+#
+# ⚠️ 这里**不写** logging.* 属性。原因：
+#   ① 「全量日志 + 错误日志」分流到两个文件，需要两个 appender 各挂一个 ThresholdFilter，
+#      application.yaml 的 logging.* 属性只能配一个文件，做不到；
+#   ② 一旦存在 logback-spring.xml，Spring Boot 就不会再创建它内置的 file appender
+#      ⇒ 写在这儿的 logging.logback.rollingpolicy.* 会被**静默忽略**（看着像配了、其实没用），
+#      所以干脆不写，免得误导后来人。
+
+# ── 启动时自动建库建表（实现在 com.esdllm.config.DbInitializer）─────────────────
+# 目的：新环境里 `java -jar` 直接能跑，不用再手工准备 resources/xatiiBot.db
+#       （服务器上那个库文件一直靠手工拷贝，而且 cd 错目录还会静默建出一个空库）。
+# 机制：启动时（任何 bean 实例化之前）按数据源名去 classpath 找 schema/<名字>.sql
+#       并逐条执行；SQLite 额外补建库文件所在目录 —— sqlite-jdbc 会自建**文件**
+#       但从不自建**父目录**，目录缺了就是 SQLITE_CANTOPEN。
+# 安全性：脚本里全是 CREATE ... IF NOT EXISTS，幂等；重复启动无副作用，绝不碰已有数据。
+db:
+  init:
+    enabled: true          # 设 false = 完全退回"手工准备库文件"的老路子
+    datasources: sqlite    # 逗号分隔；每个名字对应一个 classpath:schema/<名字>.sql
+                           # mysql 是历史数据迁移源（DataPortability 已停用），故不在默认列表；
+                           # 真要建就先补上 schema/mysql.sql，再把名字加到这里
 
 mybatis-plus:
   type-aliases-package: com.esdllm.model
