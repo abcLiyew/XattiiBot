@@ -3,6 +3,7 @@ package com.esdllm.botPlugins;
 import com.esdllm.bilibiliApi.http.HttpPolicy;
 import com.esdllm.common.BotAdminChecker;
 import com.esdllm.config.LoadDSConfig;
+import com.esdllm.service.CredentialGuard;
 import com.mikuac.shiro.annotation.AnyMessageHandler;
 import com.mikuac.shiro.annotation.MessageHandlerFilter;
 import com.mikuac.shiro.annotation.common.Shiro;
@@ -14,7 +15,9 @@ import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.regex.Pattern;
 
@@ -25,7 +28,7 @@ import java.util.regex.Pattern;
  * （不带指纹 Cookie → HTTP 412；带上匿名指纹 → 业务码 -352），必须注入真实登录 Cookie。
  * 手动改 SQLite 太重，这里给一条命令。
  *
- * <p><b>支持的命令</b>（<b>仅机器人所有者</b>可用，私聊与群聊一视同仁）：
+ * <p><b>支持的命令</b>（<b>仅机器人管理员</b>可用，私聊与群聊一视同仁）：
  * <pre>
  * 设置cookie buvid3:xxxx buvid4:yyyy SESSDATA:zzzz
  * 设置cookie
@@ -39,6 +42,10 @@ import java.util.regex.Pattern;
  * 设置代理 127.0.0.1:7890                        ← 让 B 站请求走这个 HTTP 代理
  * 代理状态                                       ← 看当前出口
  * 清除代理                                       ← 恢复直连
+ *
+ * 开关                                           ← 列出所有功能开关
+ * 开关 热评 开                                   ← 改一项（热评/主播/摘要/动态源/探测间隔）
+ * 开关 探期间隔 12                                ← 数字项直接给值
  * </pre>
  *
  * <p><b>什么时候需要配代理</b>：Cookie 完全正确（日志里"出站身份"的键名齐全）却仍持续 412
@@ -49,6 +56,19 @@ import java.util.regex.Pattern;
  * 所以只认 {@code admin} 表白名单（{@code common/BotAdminChecker#isBotAdmin}）：
  * <b>群主/群管理员这类平台身份不算</b>，<b>私聊也不再默认放行</b>
  * —— 否则任何能给机器人发私信的人都能改全局凭据。
+ *
+ * <p>⚠️ <b>新增命令一律走 {@link #guard}</b>：权限判定与异常兜底都在那里，
+ * 各 handler 不要再自己写一遍（原先有 7 份拷贝，而且都没有 {@code catch}）。
+ *
+ * <p><b>⚠️ 这里刻意用 {@code isBotAdmin}，而不是 {@code BiliLoginPlugins} 用的
+ * {@code isBotOwner}</b>：两者是<b>不同口径</b>，不是同一条口径的松紧两档。
+ * <ul>
+ *   <li>本插件的「设置cookie / 设置代理」= <b>配置</b>：管理员交出的是一份
+ *       <b>他自己已经持有</b>的凭据或出口，属于运维动作 ⇒ 机器人管理员即可。</li>
+ *   <li>{@code 登录} = <b>授权转移</b>：二维码谁扫到、机器人就以<b>谁</b>的账号出站，
+ *       发起方与受益方可以不是同一个人 ⇒ 只给所有者。</li>
+ * </ul>
+ * 两个插件的判定<b>不要"顺手统一"</b>，语义不同（详见 {@code BotAdminChecker} 的类注释）。
  *
  * <p><b>安全约定</b>：
  * <ul>
@@ -77,6 +97,15 @@ public class BiliConfigPlugins {
     private static final String CMD_PROXY_STATUS = "(?is)^" + LEADING_CQ + "(?:代理状态|查看代理|代理查询).*";
     /** 清除代理 */
     private static final String CMD_PROXY_CLEAR = "(?is)^" + LEADING_CQ + "(?:清除|删除|清空)代理.*";
+    /**
+     * 功能开关：<code>开关</code>（列出全部）/ <code>开关 热评 开</code>（修改一项）。
+     *
+     * <p>末尾刻意用 <code>(?:\\s.*|状态)?$</code> 而不是 <code>.*</code>：尾巴上必须紧跟
+     * <b>空白或行尾</b>，否则群友随手打的「<b>开关</b>灯怎么修」会被当成命令吃掉并回一句
+     * "未知开关"。宁可漏判（用户补个空格即可），也不要误判别人的日常聊天。
+     */
+    private static final String CMD_SWITCH =
+            "(?is)^" + LEADING_CQ + "(?:功能)?开关(?:\\s.*|状态)?$";
 
     /** 分隔符：空白、分号（兼容 `a=1; b=2` 与 `key:value` 混排） */
     private static final Pattern TOKEN_SPLIT = Pattern.compile("[\\s;]+");
@@ -91,6 +120,8 @@ public class BiliConfigPlugins {
     private LoadDSConfig loadDSConfig;
     @Resource
     private BotAdminChecker botAdminChecker;
+    @Resource
+    private CredentialGuard credentialGuard;
 
     /**
      * 设置 Cookie（增量合并 + 即时生效，无需重启）。
@@ -98,10 +129,11 @@ public class BiliConfigPlugins {
     @AnyMessageHandler
     @MessageHandlerFilter(cmd = CMD_SET, at = AtEnum.BOTH)
     public void setCookie(Bot bot, AnyMessageEvent event) {
-        if (!botAdminChecker.isBotAdmin(event)) {
-            send(bot, event, denyMessage());
-            return;
-        }
+        guard(bot, event, () -> doSetCookie(bot, event));
+    }
+
+    /** 「设置cookie」的实际逻辑；权限判定与异常兜底见 {@link #guard}。 */
+    private void doSetCookie(Bot bot, AnyMessageEvent event) {
         String message = event.getMessage();
         if (message == null || message.length() > MAX_LENGTH) {
             send(bot, event, "内容过长或为空，已忽略");
@@ -139,6 +171,12 @@ public class BiliConfigPlugins {
         int before = merged.size();
         merged.putAll(pairs);
 
+        // 消息里含凭据 —— 尽量撤回。
+        // ⚠️ 撤回刻意提前到**写库之前**：这条消息里已经确认有 SESSDATA / buvid 之类的凭据，
+        //    那么无论后面保存成败，都不该让它继续留在群聊记录里。
+        //    （原先放在"保存成功之后" ⇒ 一旦写库抛异常就直接 return，凭据会一直挂在群里。）
+        boolean recalled = recall(bot, event);
+
         String cookie = join(merged);
         try {
             loadDSConfig.updateConfig(LoadDSConfig.KEY_BILI_COOKIE, cookie);
@@ -147,9 +185,6 @@ public class BiliConfigPlugins {
             send(bot, event, "保存失败：" + e.getMessage());
             return;
         }
-
-        // 消息里含凭据 —— 尽量撤回
-        boolean recalled = recall(bot, event);
 
         StringBuilder reply = new StringBuilder("✅ 已保存并即时生效（无需重启）\n")
                 .append("键：").append(String.join(", ", merged.keySet())).append("\n")
@@ -170,15 +205,24 @@ public class BiliConfigPlugins {
     }
 
     /**
-     * 查看当前生效状态（不发起网络请求）。
+     * 查看当前生效状态：<b>本地事实 + 服务端实时校验</b>。
+     *
+     * <p>前几项（是否注入 / 键名 / 长度 / config 表有没有值）都是本地事实，零成本。
+     * 但从 P0-1 起，命令会<b>再问一次服务端</b> —— 因为「已注入」不等于「还有效」，
+     * 而后者才是用户真正想知道的（历史上"Cookie 过期只能靠推送失败发现"就是这么来的）。
+     *
+     * <p>⚠️ 这一两个请求只在<b>用户主动发命令</b>时产生，频率天然很低，可以接受；
+     * <b>不要把这条逻辑搬进定时任务</b> —— 原因见 {@link CredentialGuard} 的类注释
+     * （探测打的是被风控盯着的域，且已登录时一次探测要 2 个请求）。
      */
     @AnyMessageHandler
     @MessageHandlerFilter(cmd = CMD_STATUS, at = AtEnum.BOTH)
     public void cookieStatus(Bot bot, AnyMessageEvent event) {
-        if (!botAdminChecker.isBotAdmin(event)) {
-            send(bot, event, denyMessage());
-            return;
-        }
+        guard(bot, event, () -> doCookieStatus(bot, event));
+    }
+
+    /** 「cookie状态」的实际逻辑；权限判定与异常兜底见 {@link #guard}。 */
+    private void doCookieStatus(Bot bot, AnyMessageEvent event) {
         String applied = HttpPolicy.getCookie();
         StringBuilder reply = new StringBuilder("B站 Cookie 状态\n")
                 .append("已注入：").append(HttpPolicy.hasCookie() ? "是" : "否").append("\n");
@@ -191,6 +235,21 @@ public class BiliConfigPlugins {
                 .append("：").append(saved == null || saved.isBlank() ? "未配置" : "已配置");
         if (!HttpPolicy.hasCookie()) {
             reply.append("\n\n配法：设置cookie buvid3:xxx buvid4:yyy SESSDATA:zzz");
+            send(bot, event, reply.toString());
+            return;
+        }
+
+        // —— 服务端实时校验（绕过节流：用户明确问了一次，就该拿到此刻的答案）——
+        CredentialGuard.Status status = credentialGuard.probeNow(CredentialGuard.Reason.USER_COMMAND);
+        switch (status.getVerdict()) {
+            case VALID -> reply.append("\n服务端判定：✅ 有效")
+                    .append("\n账号：").append(status.getUname() == null ? status.getUid() : status.getUname())
+                    .append("（uid ").append(status.getUid()).append("）");
+            case INVALID -> reply.append("\n服务端判定：❌ 已失效（").append(status.getSummary()).append("）")
+                    .append("\n修法：私聊发「登录」扫码，或发「设置cookie SESSDATA:...」")
+                    .append("\n（这与 -412 路径/出口被封不是一回事，换代理无效）");
+            default -> reply.append("\n服务端判定：⚠️ 未能确认（").append(status.getSummary()).append("）")
+                    .append("\n这属于网络/出口问题，不是凭据失效");
         }
         send(bot, event, reply.toString());
     }
@@ -201,10 +260,11 @@ public class BiliConfigPlugins {
     @AnyMessageHandler
     @MessageHandlerFilter(cmd = CMD_CLEAR, at = AtEnum.BOTH)
     public void clearCookie(Bot bot, AnyMessageEvent event) {
-        if (!botAdminChecker.isBotAdmin(event)) {
-            send(bot, event, denyMessage());
-            return;
-        }
+        guard(bot, event, () -> doClearCookie(bot, event));
+    }
+
+    /** 「清除cookie」的实际逻辑；权限判定与异常兜底见 {@link #guard}。 */
+    private void doClearCookie(Bot bot, AnyMessageEvent event) {
         if (loadDSConfig.getConfigMap().get(LoadDSConfig.KEY_BILI_COOKIE) == null) {
             send(bot, event, "本来就没配置 Cookie");
             return;
@@ -230,10 +290,11 @@ public class BiliConfigPlugins {
     @AnyMessageHandler
     @MessageHandlerFilter(cmd = CMD_PROXY_SET, at = AtEnum.BOTH)
     public void setProxy(Bot bot, AnyMessageEvent event) {
-        if (!botAdminChecker.isBotAdmin(event)) {
-            send(bot, event, denyMessage());
-            return;
-        }
+        guard(bot, event, () -> doSetProxy(bot, event));
+    }
+
+    /** 「设置代理」的实际逻辑；权限判定与异常兜底见 {@link #guard}。 */
+    private void doSetProxy(Bot bot, AnyMessageEvent event) {
         String raw = parseProxyArg(event.getMessage());
         if (raw.isEmpty()) {
             send(bot, event, "要给出地址，例如：设置代理 127.0.0.1:7890");
@@ -265,10 +326,11 @@ public class BiliConfigPlugins {
     @AnyMessageHandler
     @MessageHandlerFilter(cmd = CMD_PROXY_STATUS, at = AtEnum.BOTH)
     public void proxyStatus(Bot bot, AnyMessageEvent event) {
-        if (!botAdminChecker.isBotAdmin(event)) {
-            send(bot, event, denyMessage());
-            return;
-        }
+        guard(bot, event, () -> doProxyStatus(bot, event));
+    }
+
+    /** 「代理状态」的实际逻辑；权限判定与异常兜底见 {@link #guard}。 */
+    private void doProxyStatus(Bot bot, AnyMessageEvent event) {
         String saved = loadDSConfig.getConfigMap().get(LoadDSConfig.KEY_BILI_PROXY);
         StringBuilder reply = new StringBuilder("B站出站状态\n")
                 .append("代理：").append(HttpPolicy.hasProxy()
@@ -291,10 +353,11 @@ public class BiliConfigPlugins {
     @AnyMessageHandler
     @MessageHandlerFilter(cmd = CMD_PROXY_CLEAR, at = AtEnum.BOTH)
     public void clearProxy(Bot bot, AnyMessageEvent event) {
-        if (!botAdminChecker.isBotAdmin(event)) {
-            send(bot, event, denyMessage());
-            return;
-        }
+        guard(bot, event, () -> doClearProxy(bot, event));
+    }
+
+    /** 「清除代理」的实际逻辑；权限判定与异常兜底见 {@link #guard}。 */
+    private void doClearProxy(Bot bot, AnyMessageEvent event) {
         if (loadDSConfig.getConfigMap().get(LoadDSConfig.KEY_BILI_PROXY) == null) {
             send(bot, event, "本来就没配置代理");
             return;
@@ -307,6 +370,320 @@ public class BiliConfigPlugins {
             return;
         }
         send(bot, event, "🗑 已清除代理，B 站请求恢复直连");
+    }
+
+    // ------------------------------------------------------------------ 功能开关
+
+    /**
+     * 看 / 改 config 表里那几个<b>会影响 B 站请求量</b>的开关。
+     *
+     * <p>为什么要有这条命令：{@link LoadDSConfig#KEY_BILI_ANALYSIS_WITH_COMMENTS} 等几个键
+     * 在部署文档里只写了"去 config 表加一行 SQL" —— 可这些开关的使用场景恰恰是<b>临时</b>的
+     * （想让某条视频解析多带点信息、想临时把请求量压下来），为一次开关去连服务器改库不划算。
+     * 这里给一条命令，<b>改完即时生效、不用重启</b>（取值都是每次现读 configMap）。
+     *
+     * <p><b>为什么权限用 {@code isBotAdmin}</b>：这几个开关是<b>全局</b>的（影响所有群、所有订阅的
+     * 请求量），与「设置cookie / 设置代理」同一性质 ⇒ 同一口径，只认 {@code admin} 表白名单。
+     *
+     * <p><b>权限</b>：与「设置cookie / 设置代理」同口径（{@code isBotAdmin}），
+     * 由 {@link #guard} 统一判定并兜住异常。
+     */
+    @AnyMessageHandler
+    @MessageHandlerFilter(cmd = CMD_SWITCH, at = AtEnum.BOTH)
+    public void switchConfig(Bot bot, AnyMessageEvent event) {
+        guard(bot, event, () -> doSwitchConfig(bot, event));
+    }
+
+    /** 「开关」的实际逻辑；权限判定与异常兜底见 {@link #guard}。 */
+    private void doSwitchConfig(Bot bot, AnyMessageEvent event) {
+        String message = event.getMessage();
+        if (message == null || message.length() > MAX_LENGTH) {
+            send(bot, event, "内容过长或为空，已忽略");
+            return;
+        }
+
+        List<String> args = parseSwitchArgs(message);
+        if (args.isEmpty()) {
+            send(bot, event, switchPanel());
+            return;
+        }
+        Option option = Option.parse(args.get(0));
+        if (option == null) {
+            send(bot, event, "没有这个开关：「" + args.get(0) + "」\n\n" + switchPanel());
+            return;
+        }
+        if (args.size() == 1) {
+            // 只给了名字 ⇒ 展开这一项的详情（含配置键、代价、改法）
+            send(bot, event, describe(option));
+            return;
+        }
+        apply(bot, event, option, args.get(1));
+    }
+
+    /**
+     * 写一项配置。值的合法性按 {@link Kind} 分派校验，<b>校验不过就原样报错、不落库</b>
+     * —— 免得把 config 写成半吊子值（例如给布尔项写个 {@code ture}），
+     * 那种值在 fail-closed 判定下会静默变成"关"，反而比报错难查。
+     */
+    private void apply(Bot bot, AnyMessageEvent event, Option option, String rawValue) {
+        String value;
+        switch (option.kind) {
+            case BOOL -> {
+                Boolean bool = parseBool(rawValue);
+                if (bool == null) {
+                    send(bot, event, "「" + option.label + "」只认开 / 关"
+                            + "（也接受 on/off、true/false、1/0、启用/禁用）。收到：" + rawValue);
+                    return;
+                }
+                value = bool ? "true" : "false";
+            }
+            case INT -> {
+                try {
+                    value = String.valueOf(Integer.parseInt(rawValue.trim()));
+                } catch (NumberFormatException e) {
+                    send(bot, event, "「" + option.label + "」要一个整数（单位小时）。收到：" + rawValue);
+                    return;
+                }
+            }
+            case SOURCE -> {
+                String v = rawValue.trim().toLowerCase();
+                Map<String, String> notes = option.valueNotes();
+                if (!notes.containsKey(v)) {
+                    StringBuilder hint = new StringBuilder("「" + option.label + "」只能填这几个值：");
+                    notes.forEach((k, note) -> hint.append("\n  ").append(k).append(" = ").append(note));
+                    hint.append("\n收到：").append(rawValue);
+                    send(bot, event, hint.toString());
+                    return;
+                }
+                value = v;
+            }
+            default -> value = rawValue;
+        }
+
+        try {
+            loadDSConfig.updateConfig(option.key, value);
+        } catch (Exception e) {
+            log.error("保存功能开关失败，key={}", option.key, e);
+            send(bot, event, "保存失败：" + e.getMessage());
+            return;
+        }
+        // 改完顺手把"这个值是什么意思"说清楚 —— 否则用户只看到 follow 一个词，还是不知道开了什么
+        StringBuilder reply = new StringBuilder("✅ ").append(option.label).append(" → ")
+                .append(shortValue(option, value))
+                .append("（").append(option.key).append('=').append(value).append("，已即时生效、无需重启）\n")
+                .append("   作用：").append(option.desc);
+        String note = option.valueNotes().get(value);
+        if (note != null) {
+            reply.append("\n   ").append(value).append(" = ").append(note);
+        }
+        send(bot, event, reply.toString());
+        log.info("已通过聊天命令修改功能开关：{}={}", option.key, value);
+    }
+
+    /**
+     * 全部开关的一览。
+     *
+     * <p>用中文主名而不是配置键：用户发命令时该打的是「热评」，
+     * 键名放在 {@link #describe} 的单查详情里（要对着 config 表核对的场合才需要）。
+     */
+    private String switchPanel() {
+        StringBuilder sb = new StringBuilder("B站功能开关（均即时生效、无需重启）\n");
+        for (Option option : Option.values()) {
+            sb.append("· ").append(option.label).append("  [").append(currentValue(option)).append("]\n")
+                    .append("    ").append(option.desc).append("\n");
+            // 枚举项把「可选值 + 含义」一起列出来 —— 光甩 auto/follow/space 三个词等于没解释
+            option.valueNotes().forEach((value, note) ->
+                    sb.append("      ").append(value).append(" = ").append(note).append("\n"));
+        }
+        sb.append("\n改：开关 <名称> <值>　例：开关 热评 开 ｜ 开关 摘要 关 ｜ 开关 动态源 follow"
+                + "\n查单项：开关 热评");
+        return sb.toString();
+    }
+
+    /** 单项详情：当前值 + 配置键 + 代价 + 改法。 */
+    private String describe(Option option) {
+        StringBuilder sb = new StringBuilder(option.label + "：" + currentValue(option) + "\n")
+                .append("配置键：").append(option.key).append("\n")
+                .append("作用：").append(option.desc).append("\n")
+                .append("影响：").append(option.cost).append("\n");
+        Map<String, String> notes = option.valueNotes();
+        if (!notes.isEmpty()) {
+            sb.append("可选值：\n");
+            notes.forEach((value, note) -> sb.append("  ").append(value).append(" = ").append(note).append("\n"));
+        }
+        sb.append("改：开关 ").append(option.label).append(' ').append(option.exampleValue());
+        return sb.toString();
+    }
+
+    /**
+     * 该项在 config 表里的<b>当前值</b>，供人看。
+     *
+     * <p>布尔项刻意区分三种情形：未配置 / 明确的关 / <b>有值但读不出开或关</b>。
+     * 最后一种要显式打出来 —— 因为 {@link LoadDSConfig#isEnabled} 是 fail-closed 的，
+     * 一个拼错的 {@code ture} 会静默按"关"处理，不提示的话用户会以为"明明配了却不生效"。
+     */
+    private String currentValue(Option option) {
+        String raw = loadDSConfig.getConfigMap().get(option.key);
+        if (raw == null || raw.isBlank()) {
+            return switch (option.kind) {
+                case BOOL -> "未配置（按关处理）";
+                case INT -> "未配置（默认 " + CredentialGuard.DEFAULT_CHECK_HOURS + "）";
+                case SOURCE -> "未配置（按 auto 处理）";
+            };
+        }
+        if (option.kind == Kind.BOOL) {
+            if (loadDSConfig.isEnabled(option.key)) {
+                return "开";
+            }
+            return parseBool(raw) == null ? "关（值无效：" + raw + "）" : "关";
+        }
+        return raw;
+    }
+
+    /** 给回复用的短值（布尔项译成中文，其余原样）。 */
+    private static String shortValue(Option option, String value) {
+        if (option.kind != Kind.BOOL) {
+            return value;
+        }
+        return "true".equals(value) ? "开" : "关";
+    }
+
+    /**
+     * 拆出「开关」之后的参数。
+     *
+     * <p>先剥前置 CQ 码与命令词，再按空白/分号切。全角空格（U+3000）先归一化 ——
+     * 中文输入法下极容易打出来，不归一化会被当成选项名的一部分而"找不到这个开关"。
+     */
+    private static List<String> parseSwitchArgs(String message) {
+        String body = message.replaceAll("\\[CQ:[^]]*]", " ")
+                .replace('\u3000', ' ');
+        // 命令词本身可能有几种形态（开关 / 功能开关 / 开关状态），一并吃掉
+        body = body.replaceFirst("(?is)^\\s*(?:功能)?开关(?:状态)?", " ");
+        List<String> tokens = new ArrayList<>();
+        for (String token : TOKEN_SPLIT.split(body)) {
+            String t = token.trim().replaceAll("^[\"',]+", "").replaceAll("[\"',]+$", "");
+            if (!t.isEmpty()) {
+                tokens.add(t);
+            }
+        }
+        return tokens;
+    }
+
+    /**
+     * 解析布尔值。<b>只认明确的词</b>，认不出返回 {@code null}（调用方会拒绝落库），
+     * 与 {@link LoadDSConfig#isEnabled} 的 fail-closed 口径保持一致。
+     */
+    private static Boolean parseBool(String raw) {
+        if (raw == null) {
+            return null;
+        }
+        return switch (raw.trim().toLowerCase()) {
+            case "开", "开启", "启用", "是", "on", "true", "1", "yes" -> Boolean.TRUE;
+            case "关", "关闭", "禁用", "否", "off", "false", "0", "no" -> Boolean.FALSE;
+            default -> null;
+        };
+    }
+
+    /** 值的类型，决定怎么写进 config 表、怎么校验。 */
+    private enum Kind {
+        /** 布尔开关，落库为 {@code true}/{@code false} */
+        BOOL,
+        /** 整数（如小时数） */
+        INT,
+        /** 枚举（如 auto/follow/space） */
+        SOURCE
+    }
+
+    /**
+     * 一条可配置项：中文名 + 别名 + 配置键 + 类型 + 说明/代价。
+     *
+     * <p>只收「有明确取舍、用户会想临时改」的项。像 {@code pushedDynamicIds}（去重记录）
+     * 这种<b>运行状态</b>刻意不进这张表 —— 它不是给人改的参数，改坏了会重推一轮。
+     */
+    private enum Option {
+        HOT_COMMENTS("热评", Kind.BOOL, LoadDSConfig.KEY_BILI_ANALYSIS_WITH_COMMENTS,
+                "视频解析附带热评",
+                "开：单次解析的 B 站请求 1→2（热评不在 view/detail 响应里，要另打一次评论接口）",
+                "评论", "comments", "comment"),
+        LIVE_MASTER("主播", Kind.BOOL, LoadDSConfig.KEY_BILI_LIVE_WITH_MASTER_INFO,
+                "直播解析附带主播信息（粉丝数 / 粉丝牌）",
+                "开：单次解析 1→2（要另打一次 getMasterInfo）",
+                "直播", "live", "master"),
+        AI_SUMMARY("摘要", Kind.BOOL, LoadDSConfig.KEY_BILI_ANALYSIS_WITH_SUMMARY,
+                "视频解析附带 AI 摘要（B 站官方「AI 视频总结」）",
+                "开：单次解析 1→2；⚠️ 且该端点硬要求登录，未配 Cookie 时开着也不发请求",
+                "ai", "summary", "总结"),
+        DYNAMIC_SOURCE("动态源", Kind.SOURCE, LoadDSConfig.KEY_BILI_DYNAMIC_SOURCE,
+                "动态推送的数据源",
+                "⚠️ 切到 follow 的前提：配 Cookie 的那个 B 站账号必须已关注被订阅的 UP，否则推不到",
+                "动态", "数据源", "source", "dynamic"),
+        CRED_CHECK_HOURS("探测间隔", Kind.INT, LoadDSConfig.KEY_BILI_CREDENTIAL_CHECK_HOURS,
+                "凭据兜底探测间隔（小时）",
+                "≤0 = 关闭兜底（只保留推送失败时的事件驱动探测）；不配则默认 "
+                        + CredentialGuard.DEFAULT_CHECK_HOURS,
+                "探测", "间隔", "interval", "hours");
+
+        private final String label;
+        private final Kind kind;
+        private final String key;
+        private final String desc;
+        private final String cost;
+        private final String[] aliases;
+
+        Option(String label, Kind kind, String key, String desc, String cost, String... aliases) {
+            this.label = label;
+            this.kind = kind;
+            this.key = key;
+            this.desc = desc;
+            this.cost = cost;
+            this.aliases = aliases;
+        }
+
+        /** 按中文主名或别名找一项；找不到返回 {@code null}。 */
+        static Option parse(String name) {
+            if (name == null) {
+                return null;
+            }
+            String value = name.trim();
+            for (Option option : values()) {
+                if (option.label.equalsIgnoreCase(value)) {
+                    return option;
+                }
+                for (String alias : option.aliases) {
+                    if (alias.equalsIgnoreCase(value)) {
+                        return option;
+                    }
+                }
+            }
+            return null;
+        }
+
+        /** 详情里给的示例值，让人照着改。 */
+        String exampleValue() {
+            return switch (kind) {
+                case INT -> "12";
+                case SOURCE -> "follow";
+                default -> "开";
+            };
+        }
+
+        /**
+         * 枚举型选项的「取值 → 一句解释」，<b>按展示顺序</b>排列；非枚举项返回空表。
+         *
+         * <p>🔴 <b>取值集合也从这里取</b>（{@code keySet()}）—— 校验和说明是<b>同一份数据</b>，
+         * 免得出现"能填的值"和"告诉用户能填的值"对不上。原先这三个取值的解释只写在
+         * {@code cost} 字段里，而 {@code cost} 只在「单查」时显示 ⇒ 面板和改完后的回复里
+         * 都只有干巴巴的 `auto / follow / space`，用户根本不知道是什么意思。
+         */
+        Map<String, String> valueNotes() {
+            Map<String, String> notes = new LinkedHashMap<>();
+            if (this == DYNAMIC_SOURCE) {
+                notes.put("auto", "先试空间流（按 uid 逐个拉），被判风控就自动切关注流 —— 默认值，不用改");
+                notes.put("follow", "始终走关注流：一轮 1 次请求覆盖全部订阅；⚠️ 要求配 Cookie 的账号已关注被订阅的 UP");
+                notes.put("space", "始终按 uid 拉空间动态（出口没被 B 站单独封的环境用这个）");
+            }
+            return notes;
+        }
     }
 
     /**
@@ -450,5 +827,59 @@ public class BiliConfigPlugins {
                 + "（群主 / 群管理员身份不算，私聊也不例外）\n"
                 + "加人方式：application.yaml 里把 bot.admin 设成你的 QQ，"
                 + "或手工往 admin 表加一行 qq_uid=你的QQ。";
+    }
+
+    /**
+     * 所有「改全局配置」命令的统一外壳：<b>权限判定 + 异常兜底</b>。
+     *
+     * <p>为什么把这段抽出来（原先 7 个 handler 各写一遍，IDEA 会提示"重复的代码段"）：
+     * <ol>
+     *   <li><b>口径只有一份</b>：以后调权限只需改这里，不会出现"改漏了某条命令"；</li>
+     *   <li><b>安全判定要 fail-closed</b>：权限不足要明确回复；<b>拿不准也按无权限处理</b>
+     *       —— 所以连 {@code isBotAdmin} 自己抛异常都归到"拒绝"这一支；</li>
+     *   <li><b>异常不能穿出 handler</b>：原先这里一个 {@code catch} 都没有 —— 处理中一旦抛异常，
+     *       消息处理链路就断了，<b>用户什么回复都收不到</b>，只能靠翻日志猜。</li>
+     * </ol>
+     *
+     * <p>⚠️ 只包「改全局配置」这一组命令。<b>不要把只读查询类命令也套进来</b>
+     * —— 例如 {@code BiliSearchPlugins} 的「搜视频 / 热搜」刻意不做权限门（只读、匿名、无副作用），
+     * 套上会让群里所有人都用不了。
+     *
+     * @param action 真正的命令逻辑，<b>只在通过权限判定后执行</b>
+     * @return 是否执行了 {@code action}（{@code false} = 权限不足，已回复拒绝消息）
+     */
+    private boolean guard(Bot bot, AnyMessageEvent event, Runnable action) {
+        try {
+            if (!botAdminChecker.isBotAdmin(event)) {
+                send(bot, event, denyMessage());
+                return false;
+            }
+        } catch (Exception e) {
+            // 权限判定本身炸了（例如查 admin 表出错）⇒ 按"无权限"处理，绝不放行
+            log.error("B站配置命令的权限判定异常，已按拒绝处理", e);
+            safeSend(bot, event, denyMessage());
+            return false;
+        }
+        try {
+            action.run();
+        } catch (Exception e) {
+            log.error("处理 B站配置命令失败", e);
+            safeSend(bot, event, "处理失败：" + e.getMessage());
+        }
+        return true;
+    }
+
+    /**
+     * 回复命令结果，<b>并保证"回复失败"不会再抛出去</b>。
+     *
+     * <p>用在 catch 路径上：那时进程已经处于"出过错"的状态，如果连发消息也失败
+     * （连接断了 / 被禁言），异常会从 {@link #guard} 的 catch 里二次逃逸。
+     */
+    private static void safeSend(Bot bot, AnyMessageEvent event, String message) {
+        try {
+            send(bot, event, message);
+        } catch (Exception e) {
+            log.debug("回复命令结果时再次异常，已忽略：{}", e.toString());
+        }
     }
 }

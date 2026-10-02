@@ -85,6 +85,68 @@ public class LoadDSConfig {
      */
     public static final String KEY_PUSHED_DYNAMIC_IDS = "pushedDynamicIds";
 
+    /**
+     * 配置键：B 站<b>凭据兜底探测</b>的间隔（小时），默认 <b>6</b>；<b>≤0 表示关闭</b>。
+     *
+     * <p><b>它兜的是什么</b>：Cookie 失效在本项目是<b>静默</b>的 —— 动态推送拉不到列表，
+     * 但用户看到的现象只是"机器人突然不推了"。默认的探测形态是<b>事件驱动</b>
+     * （推送一失败就顺手问一次服务端，见 {@code CredentialGuard#probe}），
+     * 常态下零额外请求；可它有个盲区：<b>一整天没有动态可推 ⇒ 推送从不失败 ⇒ 永远不探</b>。
+     * 本键就是这个盲区的兜底频率。
+     *
+     * <p>间隔之所以是"小时"级：一次探测打的是 {@code x/web-interface/nav}，
+     * 而服务端认为已登录时库<b>还会再问一次 {@code cookie/info}</b> ⇒ 一次探测 = 2 个请求，
+     * 且这条通道正是被风控盯着的那个域。凭据失效是个"以小时/天计"的状态，不值得高频问。
+     *
+     * <p>改动即时生效（每次兜底检查时读取），不需要重启。
+     */
+    public static final String KEY_BILI_CREDENTIAL_CHECK_HOURS = "biliCredentialCheckHours";
+
+    /**
+     * 配置键：视频链接解析是否<b>附带热评</b>。取值 {@code true/1/on/yes} 才开，<b>默认关</b>。
+     *
+     * <p><b>为什么默认关</b>：热评不在 {@code view/detail} 的响应里（该响应的 {@code reply}
+     * 字段实测恒回一条空壳，见 {@code BilibiliAnalysisImpl#fetchHotComments}），
+     * 只能另开一次评论接口 ⇒ <b>单次解析请求数 1 → 2</b>。而线上正被
+     * {@code feed/space} 的 {@code -412} 困扰（该风控对请求密度敏感），
+     * 所以"默认不加请求、谁想要谁开"是既定纪律。
+     *
+     * <p>改动即时生效（每次解析时读取），不需要重启。
+     */
+    public static final String KEY_BILI_ANALYSIS_WITH_COMMENTS = "biliAnalysisWithComments";
+
+    /**
+     * 配置键：直播链接解析是否<b>附带主播信息</b>（粉丝数 / 粉丝牌名）。
+     * 取值 {@code true/1/on/yes} 才开，<b>默认关</b>。
+     *
+     * <p><b>代价</b>：{@code LiveRoom} 里没有粉丝数，只能另打一次
+     * {@code LiveExtra#getMasterInfo} ⇒ <b>单次解析请求数 1 → 2</b>。
+     * （好消息是<b>不需要</b>再调 {@code Live#getUid(roomId)} —— uid 本来就在
+     * {@code getLiveRoom} 的响应里，见 {@code BilibiliAnalysisImpl#fetchMasterInfo}。）
+     *
+     * <p>改动即时生效（每次解析时读取），不需要重启。
+     */
+    public static final String KEY_BILI_LIVE_WITH_MASTER_INFO = "biliLiveWithMasterInfo";
+
+    /**
+     * 配置键：视频链接解析是否<b>附带 AI 摘要</b>（B 站官方「AI 视频总结」）。
+     * 取值 {@code true/1/on/yes} 才开，<b>默认关</b>。
+     *
+     * <p><b>为什么默认关</b>：摘要不在 {@code view/detail} 的响应里，要另打一次
+     * {@code x/web-interface/view/conclusion/get} ⇒ <b>单次解析请求数 1 → 2</b>。
+     *
+     * <p>🔴 <b>它比另外两项多一道硬门槛：该端点要「WBI 签名 + 登录凭据」两样，缺一不可。</b>
+     * 没有注入 Cookie 时必定 {@code -101}（未登录）—— 所以
+     * {@code BilibiliAnalysisImpl#fetchAiSummary} 在<b>无 Cookie 时一个请求都不发</b>，
+     * 这个开关开不开都一样。也就是说：<b>开了这个开关还必须配好 Cookie 才会生效</b>。
+     *
+     * <p>⚠️ 另外并非每个视频都有摘要（B 站只对部分视频生成），这是<b>正常情况不是错误</b>，
+     * 代码里静默跳过、不报错。
+     *
+     * <p>改动即时生效（每次解析时读取），不需要重启。
+     */
+    public static final String KEY_BILI_ANALYSIS_WITH_SUMMARY = "biliAnalysisWithSummary";
+
     @Value(value = "${bot.qq}")
     Long botQQ;
     @Value(value = "${bot.admin}")
@@ -256,6 +318,31 @@ public class LoadDSConfig {
     }
 
     /**
+     * 读一个<b>布尔开关</b>。
+     *
+     * <p>判定是 <b>fail-closed</b> 的：<b>只有明确写成 {@code true / 1 / on / yes}
+     * 才算开</b>，其余（键缺失、值空白、拼错成 {@code ture}、写成 {@code 0}/{@code false}）
+     * 一律按关处理。理由是这个开关的作用是"多打一次 B 站接口"，
+     * 而"配置写错反而把请求量放大"比"配置写错没生效"难查得多。
+     *
+     * <p>取值每次都从 {@link #configMap} 现读，所以改配置即时生效、不用重启。
+     *
+     * @param key 配置键（用本类里的 {@code KEY_*} 常量）
+     * @return 是否开启
+     */
+    public boolean isEnabled(String key) {
+        String raw = configMap.get(key);
+        if (raw == null) {
+            return false;
+        }
+        String value = raw.trim();
+        return "true".equalsIgnoreCase(value)
+                || "1".equals(value)
+                || "on".equalsIgnoreCase(value)
+                || "yes".equalsIgnoreCase(value);
+    }
+
+    /**
      * 更新数据库中的配置
      * @param key 配置键
      * @param value 配置值
@@ -309,6 +396,23 @@ public class LoadDSConfig {
             applyBiliCookie();
         } else if (KEY_BILI_PROXY.equals(key)) {
             applyBiliProxy();
+        } else if (KEY_BILI_CREDENTIAL_CHECK_HOURS.equals(key)) {
+            // 间隔由 CredentialGuard 每次兜底检查时读取（与 biliDynamicSource 同一范式），
+            // 这里只回显一次，方便确认"改对了、立即生效了"。
+            log.info("B 站凭据兜底探测间隔已改为 {} 小时（0 或负数 = 关闭兜底，只保留推送失败时的事件驱动探测）",
+                    configMap.get(key));
+        } else if (KEY_BILI_ANALYSIS_WITH_COMMENTS.equals(key)) {
+            log.info("视频解析附带热评已{}（开启后单次解析的 B 站请求数 1 → 2）",
+                    isEnabled(key) ? "开启" : "关闭");
+        } else if (KEY_BILI_LIVE_WITH_MASTER_INFO.equals(key)) {
+            log.info("直播解析附带主播信息（粉丝数/粉丝牌）已{}（开启后单次解析的 B 站请求数 1 → 2）",
+                    isEnabled(key) ? "开启" : "关闭");
+        } else if (KEY_BILI_ANALYSIS_WITH_SUMMARY.equals(key)) {
+            // ⚠️ 这项多一道依赖：端点硬要求登录，没 Cookie 时即使开着也不发请求
+            boolean on = isEnabled(key);
+            log.info("视频解析附带 AI 摘要已{}（开启后单次解析的 B 站请求数 1 → 2）；当前{}",
+                    on ? "开启" : "关闭",
+                    HttpPolicy.hasCookie() ? "已配置 Cookie，可生效" : "未配置 Cookie ⇒ 该项不会生效");
         }
     }
 

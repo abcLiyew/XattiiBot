@@ -3,6 +3,7 @@ package com.esdllm.botPlugins;
 import com.esdllm.config.LoadDSConfig;
 import com.esdllm.contant.BiliBiliContant;
 import com.esdllm.model.respObj.PushInfoResp;
+import com.esdllm.service.CredentialGuard;
 import com.esdllm.service.PushInfoService;
 import com.mikuac.shiro.annotation.AnyMessageHandler;
 import com.mikuac.shiro.annotation.MessageHandlerFilter;
@@ -30,6 +31,8 @@ public class BiliBiliPushPlugins {
     private PushInfoService pushInfoService;
     @Resource
     private BotContainer botContainer;
+    @Resource
+    private CredentialGuard credentialGuard;
 
     /**
      * 添加订阅
@@ -104,14 +107,40 @@ public class BiliBiliPushPlugins {
     }
 
     /**
+     * 直播推送重入保护：上一轮还没跑完就跳过本轮。
+     *
+     * <p><b>为什么必须有</b>（与 {@link #dynamicPushRunning} 同一个理由，但直播这边漏掉了）：
+     * {@code @Async} + {@code @Scheduled} 的组合下，调度线程是"把方法丢给线程池就返回"，
+     * 它并不知道异步任务何时结束。而一轮直播推送要对每个订阅打若干次 HTTP，
+     * 耗时超过 10 秒的调度间隔是常态 —— 没有这道闸，两轮会<b>并发</b>执行，
+     * 各自读到"库里还是未开播"、各自判定"状态变了"，于是同一个开播事件被<b>同时推好几条</b>。
+     * 这也是 2026-10-02 用户报的"直播推送有时候会同时发好多次"的根因之一。
+     */
+    private final AtomicBoolean livePushRunning = new AtomicBoolean(false);
+
+    /**
      * 直播推送
      */
     @Async
     @Scheduled(cron = "0/10 * * * * *")
     public void livePush() {
-        Bot bot = getBotFromConfig();
-
-        pushInfoService.livePush(bot);
+        if (!livePushRunning.compareAndSet(false, true)) {
+            log.warn("上一轮直播推送尚未结束，跳过本轮");
+            return;
+        }
+        try {
+            Bot bot = getBotFromConfig();
+            if (bot == null) {
+                return;
+            }
+            pushInfoService.livePush(bot);
+        } catch (Throwable e) {
+            // ★ Throwable 而非 Exception：与 dynamicPush 同一口径 ——
+            //   Java2D 在无字体环境下抛的是 java.lang.InternalError（Error），catch(Exception) 兜不住。
+            log.error("直播推送执行异常", e);
+        } finally {
+            livePushRunning.set(false);
+        }
     }
 
     /**
@@ -162,6 +191,34 @@ public class BiliBiliPushPlugins {
             log.error("动态推送执行异常", e);
         } finally {
             dynamicPushRunning.set(false);
+        }
+    }
+
+    /**
+     * B 站凭据<b>兜底探测</b>（低频）。
+     *
+     * <p>为什么需要它：P0-1 的主形态是<b>事件驱动</b> —— 动态推送一失败就顺手问一次服务端
+     * （见 {@code PushInfoServiceImpl#dynamicPush} 的失败分支），常态零额外请求。
+     * 可它有个盲区：<b>一整天没有动态可推 ⇒ 推送从不失败 ⇒ 永远不探</b>，
+     * 于是"凭据昨天就废了"要等到下一条动态出现才暴露 —— 这正是本任务兜的洞。
+     *
+     * <p>本任务只负责"到点了敲一下"：真正的间隔判定在
+     * {@link CredentialGuard#maybeProbeFallback()}（默认 6 小时一次，
+     * 可用 config 表 {@code biliCredentialCheckHours} 调整，0 = 关闭兜底）；
+     * 启动后第一次触发即会校验一次，顺带实现"长驻进程启动时验一次凭据"。
+     *
+     * <p>调度频率取 10 分钟（远细于兜底间隔）只是为了让"改了配置"较快生效，
+     * <b>绝大多数轮次读完一个时间戳就返回，一个请求都不发</b>。
+     */
+    @Async
+    @Scheduled(fixedRate = 600_000)
+    public void credentialCheck() {
+        try {
+            credentialGuard.maybeProbeFallback();
+        } catch (Throwable e) {
+            // ★ Throwable 而非 Exception：与其它异步入口同一口径
+            //   （Java2D 在无字体环境抛的是 java.lang.InternalError，catch(Exception) 兜不住）
+            log.error("B 站凭据兜底探测执行异常", e);
         }
     }
 

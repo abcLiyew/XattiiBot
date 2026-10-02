@@ -1,7 +1,7 @@
 package com.esdllm.mapper;
 
-import com.esdllm.model.SignInRecords;
 import com.baomidou.mybatisplus.core.mapper.BaseMapper;
+import com.esdllm.model.SignInRecords;
 
 /**
 * @author LiYehe

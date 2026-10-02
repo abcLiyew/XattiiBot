@@ -67,7 +67,10 @@ XatiiBot 是一个基于 Java 开发的 QQ 机器人，主要用于解析和分�
 - BilibiliAnalysisPlugin ：识别消息中的 Bilibili 链接，并分发给解析服务
 - BilibiliAnalysisImpl ：Bilibili 视频、直播、动态内容解析的核心实现
 - BiliBiliPushPlugins ：处理「添加订阅 / 取消订阅」指令，并定时推送开播、下播与投稿动态
-- BiliConfigPlugins ：处理「设置cookie / cookie状态 / 清除cookie」与「设置代理 / 代理状态 / 清除代理」指令，管理动态推送所需的 B 站登录凭据与出口
+- BiliConfigPlugins ：处理「设置cookie / cookie状态 / 清除cookie」「设置代理 / 代理状态 / 清除代理」与「开关」指令，管理动态推送所需的 B 站登录凭据、出口与功能开关
+- BiliLoginPlugins ：处理「登录」扫码登录（仅机器人所有者、仅私聊）与「登录状态」查询
+- BiliSearchPlugins ：处理「搜视频 / 热搜 / 今日热门」三条只读查询指令
+- CredentialGuard ：B 站凭据探测与缓存的统一入口（事件驱动 + 定时兜底）
 - SignInPlugins ：处理「签到 / 查询 / 今日运势」指令，维护群内好感度
 - PushInfoServiceImpl ：订阅的增删与推送逻辑，含管理员鉴权
 - SignInRecordsServiceImpl ：签到数据读写与好感度结算
@@ -75,6 +78,61 @@ XatiiBot 是一个基于 Java 开发的 QQ 机器人，主要用于解析和分�
 - LoadDSConfig ：启动时从数据库加载运行时配置，支持热更新
 - AdminService/AdminMapper ：处理管理员相关的数据库操作
 - mapper/* 与 resources/mapper/*.xml ：MyBatis-Plus 数据访问层
+
+## 可选功能开关（config 表）
+
+以下功能**默认关闭**，**两种改法都可**，且**热改即时生效、不用重启**。
+之所以默认关：它们每开一个都会让「发一条视频/直播链接」的 B 站请求数从 1 次变成 2 次，
+而 B 站的风控是**请求密度敏感**型（线上曾因请求过密吃到 `-412`）。
+
+| key | 值 | 效果 | 额外前提 |
+|---|---|---|---|
+| `biliAnalysisWithSummary` | `true` | 视频解析附带**AI 摘要**（总纲 + 前 3 个分段大纲） | ⚠️ **必须已配置 `biliCookie`**：该端点硬要求登录，无 Cookie 时即使开着也不会生效 |
+| `biliAnalysisWithComments` | `true` | 视频解析附带**热评** Top3（赞数 + 昵称） | 无（匿名可用） |
+| `biliLiveWithMasterInfo` | `true` | 直播解析附带**主播粉丝数 + 粉丝牌** | 无（匿名可用） |
+| `biliCredentialCheckHours` | 数字，如 `6` | 凭据兜底探测间隔（小时）；`0` 或负数 = 关闭兜底 | 无（无 Cookie 时不探测） |
+
+### 改法一：聊天命令（推荐）
+
+**只允许 `admin` 表里的管理员**使用（与「设置cookie / 设置代理」同一权限口径）。
+
+```
+开关                                   ← 列出全部开关及当前值
+开关 热评 开                           ← 改一项，改完即时生效
+开关 摘要 关
+开关 动态源 follow                      ← 切动态推送数据源（三个取值见下表）
+开关 探测间隔 12                        ← 凭据兜底探测间隔（小时），0 = 关闭
+开关 热评                              ← 只看这一项的详情（含配置键、可选值含义）
+```
+
+名称可用中文主名或别名：`热评`/`评论`/`comments`、`主播`/`直播`/`live`、
+`摘要`/`ai`/`summary`、`动态源`/`动态`/`source`、`探测间隔`/`探测`/`interval`。
+布尔项的值认 `开`/`关`（也接受 `on`/`off`、`true`/`false`、`1`/`0`、`启用`/`禁用`）。
+
+**「动态源」的三个取值是什么意思**（机器人面板与详情里也会一并列出来）：
+
+| 值 | 含义 |
+|---|---|
+| `auto` | 先试空间流（按 uid 逐个拉），被判风控就自动切关注流 —— **默认值，一般不用改** |
+| `follow` | 始终走关注流：一轮 1 次请求覆盖全部订阅；⚠️ 要求配 Cookie 的那个账号**已关注**被订阅的 UP |
+| `space` | 始终按 uid 拉空间动态（出口没被 B 站单独封的环境用这个） |
+
+> 为什么会有这三种取值：见下面的《动态数据源：feed/space 与「关注流」》一节。
+
+> 面板里若显示 `关（值无效：xxx）`，说明 config 表里的值既不是开也不是关
+> —— 在 fail-closed 判定下它按**关**处理，请用命令或 SQL 重新写成合法值。
+
+### 改法二：直接写数据库（机器人没开机、或要批量改时）
+
+```sql
+INSERT INTO config(key, value) VALUES ('biliAnalysisWithSummary', 'true');
+-- 已有该行时改用 UPDATE（注意应用实际读的是 ./resources/xatiiBot.db）
+```
+
+布尔开关的判定是 **fail-closed** 的：只有写成 `true` / `1` / `on` / `yes` 才算开，
+键不存在、值为空、拼错（如 `ture`）一律按**关**处理 —— 免得"配置写错反而把请求量放大"。
+开关状态可在启动日志、改配置时的回显、或直接发「开关」命令确认（AI 摘要那项还会额外报一句 Cookie 有没有配）。
+
 ## 使用方法
 1. 确保已安装 Java 17 或更高版本
 2. 配置数据库连接
@@ -83,7 +141,7 @@ XatiiBot 是一个基于 Java 开发的 QQ 机器人，主要用于解析和分�
    
    mvn clean package
    
-   java -jar target/XatiiBot-2.0.0-beta.jar
+   java -jar target/XatiiBot-2.0.1-beta.jar
    ```
 4. 将机器人添加到 QQ 群中，当有人发送 Bilibili 链接时，机器人会自动解析并回复相关信息
 

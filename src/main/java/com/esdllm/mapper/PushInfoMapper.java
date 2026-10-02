@@ -1,7 +1,7 @@
 package com.esdllm.mapper;
 
-import com.esdllm.model.PushInfo;
 import com.baomidou.mybatisplus.core.mapper.BaseMapper;
+import com.esdllm.model.PushInfo;
 
 /**
 * @author LiYehe

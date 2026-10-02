@@ -6,7 +6,7 @@
 
     <groupId>com.esdllm</groupId>
     <artifactId>XatiiBot</artifactId>
-    <version>2.0.0-beta</version>
+    <version>2.0.1-beta</version>
 
     <build>
         <plugins>
@@ -51,7 +51,17 @@
         <dependency>
             <groupId>com.esdllm</groupId>
             <artifactId>bilibili-api</artifactId>
-            <version>0.9.28-beta</version>
+            <version>0.10.0-SNAPSHOT</version>
+        </dependency>
+
+        <!-- 二维码渲染（扫码登录用）：bilibili-api 的 Login 门面只负责「拿到二维码内容」，
+             把它画成可扫的图是调用方的事。上游把 zxing 限定在 scope=test（不向下游传递），
+             所以本工程必须自己引。只用 core（QRCodeWriter + BitMatrix），
+             PNG 由 JDK 自带的 ImageIO 写，不引 javase。 -->
+        <dependency>
+            <groupId>com.google.zxing</groupId>
+            <artifactId>core</artifactId>
+            <version>3.3.3</version>
         </dependency>
 
         <!-- Lombok：bilibili-api 0.9.20-beta 起把 lombok 声明为 provided（不向下游传递），

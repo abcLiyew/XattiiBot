@@ -1,18 +1,21 @@
 package com.esdllm.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.esdllm.bilibiliApi.bilibiliApi.BilibiliClient;
 import com.esdllm.bilibiliApi.bilibiliApi.CardInfo;
 import com.esdllm.bilibiliApi.bilibiliApi.Dynamic;
 import com.esdllm.bilibiliApi.bilibiliApi.Live;
+import com.esdllm.bilibiliApi.model.data.pojo.LiveRoom;
 import com.esdllm.common.BotAdminChecker;
 import com.esdllm.config.LoadDSConfig;
 import com.esdllm.contant.BiliBiliContant;
+import com.esdllm.mapper.PushInfoMapper;
 import com.esdllm.model.PushInfo;
 import com.esdllm.model.respObj.PushInfoResp;
+import com.esdllm.service.CredentialGuard;
 import com.esdllm.service.PushInfoService;
-import com.esdllm.mapper.PushInfoMapper;
 import com.mikuac.shiro.common.utils.MsgUtils;
 import com.mikuac.shiro.core.Bot;
 import com.mikuac.shiro.dto.action.common.ActionData;
@@ -28,19 +31,7 @@ import java.awt.image.BufferedImage;
 import java.io.IOException;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
-import java.time.ZoneId;
-import java.time.ZonedDateTime;
-import java.util.ArrayList;
-import java.util.Date;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -210,6 +201,14 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
     private BotAdminChecker botAdminChecker;
     @Resource
     private LoadDSConfig loadDSConfig;
+    /**
+     * B 站凭据状态的探测器（P0-1）。
+     *
+     * <p>只在这一轮<b>确实拉取失败</b>时才被调用 —— 常态（Cookie 有效）下
+     * 一轮推送的请求数与以前<b>完全一致</b>。
+     */
+    @Resource
+    private CredentialGuard credentialGuard;
 
     @Override
     public PushInfoResp pushAdd(Long roomId, AnyMessageEvent event) {
@@ -300,40 +299,130 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
     @Override
     public void livePush(Bot bot) {
         List<PushInfo> list = pushInfoMapper.selectList(null);
+        if (list.isEmpty()) {
+            return;
+        }
         // 创建一次对象，避免在循环中重复创建
-        Live liveRoom = new Live();
+        Live live = new Live();
         CardInfo cardInfo = new CardInfo();
 
+        // ★ 一轮内「房间 → 直播间信息」缓存。
+        //
+        // 上游 Live 门面的每个 getter 都是一次真实 HTTP：它们各自调
+        // LiveService.INSTANCE.load(roomId)，而 load 每次都发请求（门面注释 §6.4 明确写了
+        // "本门面不提供跨调用的实例缓存"，并要求调用方 getLiveRoom() 取一次再分发）。
+        // 所以原来推一条开播消息要打 6 次同一个接口：
+        //   getLiveStatus / getUid / getLiveTime / getLiveTitle / getLiveArea / getImageUrl
+        // 同一房间被 N 个群/私聊订阅时更是 ×N —— 而 B 站的 412 是「请求密度敏感」型风控
+        // （真机实测 1 秒内 3 个请求即触发），这种打法本身就在招风控。
+        // 缓存后：同一房间一轮只 1 次请求，其余全部读内存里的对象。
+        Map<Long, LiveRoom> roomCache = new HashMap<>();
+        // ★ 同一「目标」（群 / 私聊）一轮内只发一条，见 firstForTarget
+        Set<String> sentTargets = new HashSet<>();
+
         for (PushInfo pushInfo : list) {
-            if (!pushInfo.getLivePush().equals(0)){
+            // 0 = 开启直播推送（模型默认值 1 是"关闭"，见 pushAdd 传 0）
+            if (!Objects.equals(pushInfo.getLivePush(), 0)) {
                 continue;
             }
             try {
-                Integer currentLiveStatus = liveRoom.getLiveStatus(pushInfo.getRoomId());
-                if (!currentLiveStatus.equals(1)&& !currentLiveStatus.equals(0)){
-                    if (pushInfo.getLiveStatus().equals(0)){
+                Long roomId = pushInfo.getRoomId();
+                LiveRoom room = roomCache.get(roomId);
+                if (room == null) {
+                    try {
+                        room = live.getLiveRoom(roomId);
+                    } catch (Throwable t) {
+                        // 该房间本轮取不到信息：跳过它的所有订阅（其余订阅不受影响）。
+                        // 不缓存失败结果 —— 直播推送每 10 秒一轮，下一轮自然会重试。
+                        log.error("获取直播间信息失败，本轮跳过该订阅，房间ID: {}", roomId, t);
                         continue;
                     }
-                    String message = buildMessage(bot, pushInfo, liveRoom, cardInfo);
-                    updatePushInfoStatus(pushInfo);
-                    sendMessage(bot, pushInfo, message);
+                    roomCache.put(roomId, room);
+                }
+
+                // ⚠️ LiveRoom.live_status 是 Integer 且可能为 null
+                //   （门面的 getLiveStatus 返回 int，自动拆箱会直接 NPE —— 自己取字段就得自己兜）
+                Integer currentLiveStatus = room.getLive_status();
+                if (currentLiveStatus == null) {
+                    log.warn("直播间 {} 未返回 live_status，本轮跳过", roomId);
                     continue;
                 }
-                // 只有当直播状态发生变化时才处理
-                if (!Objects.equals(currentLiveStatus, pushInfo.getLiveStatus())) {
-                    String sendMsg = buildMessage(bot, pushInfo, liveRoom, cardInfo);
+                // 库里 live_status 可能是 NULL（历史数据 / 手工插入），同样不能直接拆箱
+                int savedStatus = pushInfo.getLiveStatus() == null ? 0 : pushInfo.getLiveStatus();
 
-                    // 更新推送信息状态
-                    updatePushInfoStatus(pushInfo);
+                // —— 轮播中（既非未开播 0 也非直播中 1）——
+                // 语义：我们认为他在播（savedStatus=1），服务端说其实在轮播 ⇒ 推一条「下播」。
+                if (!currentLiveStatus.equals(1) && !currentLiveStatus.equals(0)) {
+                    if (savedStatus == 0) {
+                        continue;
+                    }
+                    String message = buildMessage(bot, pushInfo, room, cardInfo, live);
+                    // 先把状态写库（占位），再发消息 —— 缩短"读到旧状态"的窗口，见 updatePushInfoStatus
+                    updatePushInfoStatus(pushInfo, currentLiveStatus);
+                    if (firstForTarget(sentTargets, pushInfo)) {
+                        logLivePush(pushInfo, room, savedStatus, currentLiveStatus);
+                        sendMessage(bot, pushInfo, message);
+                    }
+                    continue;
+                }
 
-                    // 发送消息
+                // 只有直播状态真的发生变化时才处理
+                if (Objects.equals(currentLiveStatus, savedStatus)) {
+                    continue;
+                }
+
+                String sendMsg = buildMessage(bot, pushInfo, room, cardInfo, live);
+                // ★ 顺序是「构建 → 写库 → 发送」，与原实现一致，但写库改用按字段更新。
+                //   先占位写库是关键：否则"读到旧状态"到"写回新状态"之间的窗口 = 1 次
+                //   直播间请求 + 1 次名片请求，慢一点就会让下一轮看到旧状态而重推。
+                updatePushInfoStatus(pushInfo, currentLiveStatus);
+                if (firstForTarget(sentTargets, pushInfo)) {
+                    logLivePush(pushInfo, room, savedStatus, currentLiveStatus);
                     sendMessage(bot, pushInfo, sendMsg);
                 }
-            } catch (Exception e) {
-                // 单个推送失败不应影响其他推送
+            } catch (Throwable e) {
+                // ★ 兜 Throwable：与 dynamicPush 同一口径（无字体环境下 Java2D 抛的是
+                //   java.lang.InternalError，是 Error 不是 Exception）。
+                //   单个推送失败不应影响其他推送。
                 log.error("处理推送信息时发生异常，房间ID: " + pushInfo.getRoomId(), e);
             }
         }
+    }
+
+    /**
+     * 同一轮里，这个「推送目标」是不是第一次要发。
+     *
+     * <p><b>为什么需要</b>：{@code push_info} 的去重口径是「房间 + 发命令的人 + 目标」，
+     * 所以同一个群里 A、B 两人各发一次「添加订阅 &lt;同一个房间&gt;」会产生<b>两条记录</b>；
+     * 而发送只看 {@code group_id}（见 {@link #sendMessage}）⇒ <b>群里连收两条一模一样</b>的开播通知。
+     *
+     * <p>这里有意识地收敛在「发送侧」而不去动数据：改去重口径会连带改掉
+     * {@code 取消订阅} 的语义（现在每人只能取消自己那条），风险远大于收益。
+     *
+     * <p>注意集合是<b>每轮新建</b>的 —— 只做"一轮内不重复"，不影响下一轮的正常推送。
+     *
+     * @param sentTargets 本轮已发过的目标集合
+     * @param pushInfo    当前订阅
+     * @return {@code true} 表示本目标是本轮第一条（可以发）
+     */
+    private static boolean firstForTarget(Set<String> sentTargets, PushInfo pushInfo) {
+        String key = pushInfo.getGroupId() != null
+                ? "g:" + pushInfo.getGroupId()
+                : "p:" + pushInfo.getQqUid();
+        return sentTargets.add(key);
+    }
+
+    /**
+     * 规则化打一行直播推送日志。
+     *
+     * <p>刻意与动态推送的 {@code 推送动态：uid=..., dynamicId=...} 同一形态 ——
+     * 出问题时可以直接 grep 这一行统计"同一事件推了几次"，不必去翻图或猜。
+     */
+    private void logLivePush(PushInfo pushInfo, LiveRoom room, int from, Integer to) {
+        log.info("推送直播：roomId={}, uid={}, 状态 {}→{}, 目标={}",
+                pushInfo.getRoomId(), room.getUid(), from, to,
+                pushInfo.getGroupId() != null ? "群" + pushInfo.getGroupId()
+                        : "私聊" + pushInfo.getQqUid());
     }
 
     @Override
@@ -362,6 +451,11 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
         Map<Long, List<Dynamic.DynamicInfo>> feedCache = new HashMap<>();
         boolean anyFetchFailure = false;
 
+        // ★ 一轮内「房间 → uid」缓存。Live 门面的每个 getter 都是一次真实 HTTP（见 livePush 的注释），
+        //   而这里原先是每条订阅调一次 getUid(roomId) —— 同一个房间被 N 个群/私聊订阅就白白打 N 次。
+        //   取不到时**不写缓存**，让下一轮的其它订阅重新试（失败是偶发的，缓存失败值反而会漏推）。
+        Map<Long, Long> uidCache = new HashMap<>();
+
         // —— 关注流模式（见 #preferFollowFeed）：整轮只拉一次，全部订阅共用 ——
         // null 表示"本轮还没拉"；拉失败后置 followFeedFailed，避免同一轮里重复撞
         Map<Long, List<Dynamic.DynamicInfo>> followByUid = null;
@@ -376,9 +470,16 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
             try {
                 // 注意：取 uid 也可能抛异常，必须放在 try 内；留在外面会让一条订阅的失败
                 // 直接中断整个 for 循环，后面的订阅全部不再推送。
-                Long uid = liveRoom.getUid(pushInfo.getRoomId());
+                Long roomId = pushInfo.getRoomId();
+                Long uid = uidCache.get(roomId);
                 if (uid == null) {
-                    log.warn("直播间 {} 取不到 uid，跳过其动态推送", pushInfo.getRoomId());
+                    uid = liveRoom.getUid(roomId);
+                    if (uid != null) {
+                        uidCache.put(roomId, uid);
+                    }
+                }
+                if (uid == null) {
+                    log.warn("直播间 {} 取不到 uid，跳过其动态推送", roomId);
                     continue;
                 }
                 subscribedUids.add(uid);
@@ -497,7 +598,29 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
         persistPushedIdsIfDirty();
 
         if (anyFetchFailure) {
-            enterRiskCooldown();
+            // ★ P0-1：失败即探测一次（事件驱动，常态零开销），把"笼统的失败"拆成两种根因：
+            //   - 服务端不认这枚 Cookie（-101 未登录）⇒ 该重新登录；
+            //   - 其它（超时 / 出口 412 / 路径封禁）⇒ 该按原逻辑退避。
+            //   这两件事的处置完全相反，混在一起就是"排障时只能靠猜"。
+            CredentialGuard.Status status = credentialGuard.probe(CredentialGuard.Reason.PUSH_FAILURE);
+            if (status.isInvalid()) {
+                // 🔴 凭据失效时**不进风控冷却**：冷却治的是"请求打得太密"，而这里的问题
+                //    是"手里的凭据已经无效" —— 冷却既修不好它，还会白拖最多 8 分钟，
+                //    并把真正的修法（重新登录）藏在一句"风控冷却中"后面。
+                if (status.isStateChanged()) {
+                    log.error("动态推送失败，且服务端判定 B 站 Cookie 已失效（{}）—— 本轮不进入风控冷却。"
+                                    + "修法：私聊发「登录」扫码，或发「设置cookie SESSDATA:...」。"
+                                    + "（注意：这与 -412 路径/出口被封不是一回事，换源与换代理都无效）",
+                            status.getSummary());
+                } else {
+                    // 持续性失效不重复刷屏 —— 状态变化的告警已由 CredentialGuard 去重承担，
+                    // 这里只需留一行可追溯的痕迹。
+                    log.debug("动态推送失败，Cookie 仍处于失效状态（{}），本轮不进入风控冷却",
+                            status.getSummary());
+                }
+            } else {
+                enterRiskCooldown();
+            }
         } else {
             // 整轮都拿到了列表 → 说明数据源是通的，把递增计数清零
             failuresLogged = 0;
@@ -1035,30 +1158,41 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
     }
 
     /**
-     * @param bot 机器人对象
-     * @param live 直播间对象
-     * @param pushInfo 推送信息对象
-     * @param cardInfo 直播卡片对象
-     * 构建推送消息
+     * 构建推送消息。
+     *
+     * <p>⚠️ <b>必须传已经取好的 {@link LiveRoom}，不要再从 {@code Live} 门面调 getter</b>：
+     * 门面的每个 getter 都是一次真实 HTTP（见 {@link #livePush} 的注释），
+     * 用门面写这条消息要打 6 次接口。
+     *
+     * <p>⚠️ 本方法依赖 {@code pushInfo.getLiveStatus()} <b>翻转之前</b>的值来决定是
+     * 「开播」还是「下播」消息，所以调用点必须排在 {@link #updatePushInfoStatus} 前面。
+     *
+     * @param bot       机器人
+     * @param pushInfo  订阅
+     * @param room      已取回的直播间信息（本轮缓存）
+     * @param cardInfo  名片门面（自带单槽缓存，复用同一实例可省掉重复请求）
+     * @param live      直播门面，仅用于 {@link Live#getLiveUrl(Long)}（纯本地拼接，不发请求）
      */
-    private String buildMessage(Bot bot, PushInfo pushInfo, Live live, CardInfo cardInfo) throws IOException {
+    private String buildMessage(Bot bot, PushInfo pushInfo, LiveRoom room, CardInfo cardInfo, Live live) throws IOException {
         List<Long> atListStr = pushInfo.getAtList();
         Long roomId = pushInfo.getRoomId();
-        Long uid = live.getUid(roomId);
+        Long uid = room.getUid();
         String userName = cardInfo.getUserName(uid);
+        String liveUrl = live.getLiveUrl(roomId);
 
         // 开播消息
-        if (pushInfo.getLiveStatus().equals(0)) {
+        if (pushInfo.getLiveStatus() == null || pushInfo.getLiveStatus().equals(0)) {
             // 处理开播时间
-            processLiveStartTime(pushInfo, live);
+            processLiveStartTime(pushInfo, room);
 
             // 根据不同情况构建开播消息
-            if (pushInfo.getAtAll().equals(1) && isGroupAdmin(bot, pushInfo.getGroupId()) ) {
-                return buildAtAllLiveMessage(userName, live, roomId);
-            } else if (!atListStr.isEmpty() && !atListStr.get(0).equals(0L)) {
-                return buildAtUserLiveMessage(atListStr, userName, live, roomId);
+            Integer atAll = pushInfo.getAtAll();
+            if (atAll != null && atAll.equals(1) && isGroupAdmin(bot, pushInfo.getGroupId())) {
+                return buildAtAllLiveMessage(userName, room, liveUrl);
+            } else if (atListStr != null && !atListStr.isEmpty() && !atListStr.get(0).equals(0L)) {
+                return buildAtUserLiveMessage(atListStr, userName, room, liveUrl);
             } else {
-                return buildNormalLiveMessage(userName, live, roomId);
+                return buildNormalLiveMessage(userName, room, liveUrl);
             }
         }
         // 下播消息
@@ -1068,14 +1202,19 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
     }
 
     /**
-     * @param pushInfo 推送信息对象
-     * @param liveRoom 直播房间对象
-     * 处理直播开始时间
+     * 处理直播开始时间。
+     *
+     * <p>{@code live_time} 在未开播时服务端会给 {@code "0000-00-00 00:00:00"}，
+     * 也可能给 null/空串 —— 后两者直接跳过，不要让它抛出来把整条推送带走。
      */
-    private void processLiveStartTime(PushInfo pushInfo, Live liveRoom) {
+    private void processLiveStartTime(PushInfo pushInfo, LiveRoom room) {
+        String liveTimeText = room.getLive_time();
+        if (liveTimeText == null || liveTimeText.isBlank()) {
+            return;
+        }
         try {
             SimpleDateFormat formatter = SAFE_DATE_FORMAT.get();
-            Date liveTime = formatter.parse(liveRoom.getLiveTime(pushInfo.getRoomId()));
+            Date liveTime = formatter.parse(liveTimeText);
             pushInfo.setLiveTime(liveTime.getTime());
         } catch (ParseException e) {
             log.error("解析开播时间失败", e);
@@ -1084,24 +1223,24 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
 
     /**
      * @param userName 用户名
-     * @param liveRoom 直播房间对象
-     * @param roomId 房间ID
+     * @param room 已取回的直播间信息
+     * @param liveUrl 直播间地址（本地拼接）
      * 构建@全体成员的开播消息
      */
-    private String buildAtAllLiveMessage(String userName, Live liveRoom, Long roomId) throws IOException {
+    private String buildAtAllLiveMessage(String userName, LiveRoom room, String liveUrl) throws IOException {
         return MsgUtils.builder().atAll()
                 .text(" " + userName + " 开播了" +
-                        "\n标题：" + liveRoom.getLiveTitle(roomId) + "\n" +
-                        "分区：" + liveRoom.getLiveArea(roomId) + "\n" +
-                        "地址：" + liveRoom.getLiveUrl(roomId) + "\n")
-                .img(liveRoom.getImageUrl(roomId))
+                        "\n标题：" + room.getTitle() + "\n" +
+                        "分区：" + room.getArea_name() + "\n" +
+                        "地址：" + liveUrl + "\n")
+                .img(room.getUser_cover())
                 .build();
     }
 
     /**
      * 构建@特定用户的开播消息
      */
-    private String buildAtUserLiveMessage(List<Long> atListStr, String userName, Live liveRoom, Long roomId) throws IOException {
+    private String buildAtUserLiveMessage(List<Long> atListStr, String userName, LiveRoom room, String liveUrl) throws IOException {
         StringBuilder msgBuilder = new StringBuilder();
         for (Long aLong : atListStr) {
             msgBuilder.append(MsgUtils.builder().at(aLong).build());
@@ -1109,23 +1248,23 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
 
         return msgBuilder + MsgUtils.builder().text(" " +
                         userName + " 开播了" +
-                        "\n标题：" + liveRoom.getLiveTitle(roomId) + "\n" +
-                        "分区：" + liveRoom.getLiveArea(roomId) + "\n" +
-                        "地址：" + liveRoom.getLiveUrl(roomId) + "\n" +
-                        "[CQ:image,file=" + liveRoom.getImageUrl(roomId) + "]")
+                        "\n标题：" + room.getTitle() + "\n" +
+                        "分区：" + room.getArea_name() + "\n" +
+                        "地址：" + liveUrl + "\n" +
+                        "[CQ:image,file=" + room.getUser_cover() + "]")
                 .build();
     }
 
     /**
      * 构建普通开播消息
      */
-    private String buildNormalLiveMessage(String userName, Live liveRoom, Long roomId) throws IOException {
+    private String buildNormalLiveMessage(String userName, LiveRoom room, String liveUrl) throws IOException {
         return MsgUtils.builder()
                 .text(" " + userName + " 开播了" +
-                        "\n标题：" + liveRoom.getLiveTitle(roomId) + "\n" +
-                        "分区：" + liveRoom.getLiveArea(roomId) + "\n" +
-                        "地址：" + liveRoom.getLiveUrl(roomId) +"?live_from="+(int)(Math.random()*10000)+"&spm_id_from=333.1007.top_right_bar_window_dynamic.content.click"+ "\n" +
-                        "[CQ:image,file=" + liveRoom.getImageUrl(roomId) + "]")
+                        "\n标题：" + room.getTitle() + "\n" +
+                        "分区：" + room.getArea_name() + "\n" +
+                        "地址：" + liveUrl +"?live_from="+(int)(Math.random()*10000)+"&spm_id_from=333.1007.top_right_bar_window_dynamic.content.click"+ "\n" +
+                        "[CQ:image,file=" + room.getUser_cover() + "]")
                 .build();
     }
 
@@ -1156,13 +1295,29 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
     }
 
     /**
-     * 更新推送信息状态
+     * 把该订阅的直播状态写回库里，并同步内存对象。
+     *
+     * <p><b>两处改动，都是为了收窄影响面</b>：
+     * <ol>
+     *   <li><b>只更新 {@code live_status} + {@code live_time} 两列</b>，不用 {@code updateById}
+     *       整行覆盖。整行覆盖等于把"轮首读到的那份快照"整个写回去，
+     *       这一轮里对同一条记录的其它改动会被悄悄压掉。</li>
+     *   <li><b>直接写入服务端的真实状态</b>，不做原来的「0↔1 翻转」。
+     *       翻转只在状态严格二值时才等价；一旦服务端给出第三种值（轮播），
+     *       翻转得到的值就不再是"服务端说的那个状态"，下一轮又要再进一次分支。</li>
+     * </ol>
+     *
+     * <p>⚠️ {@code live_time} <b>必须一起写</b>：开播时 {@link #processLiveStartTime}
+     * 刚把它更新成本次开播时刻，下播时长（{@link #buildLiveEndMessage}）就是靠它算的。
+     * 只写 live_status 会让时长永远按上一次开播的时刻算。
      */
-    private void updatePushInfoStatus(PushInfo pushInfo) {
-        // 切换直播状态
-        pushInfo.setLiveStatus(pushInfo.getLiveStatus().equals(0) ? 1 : 0);
-        pushInfo.setUpdateTime(null);
-        pushInfoMapper.updateById(pushInfo);
+    private void updatePushInfoStatus(PushInfo pushInfo, Integer newStatus) {
+        pushInfo.setLiveStatus(newStatus);
+        Long liveTime = pushInfo.getLiveTime() == null ? 0L : pushInfo.getLiveTime();
+        pushInfoMapper.update(null, new LambdaUpdateWrapper<PushInfo>()
+                .eq(PushInfo::getPid, pushInfo.getPid())
+                .set(PushInfo::getLiveStatus, newStatus)
+                .set(PushInfo::getLiveTime, liveTime));
     }
 
     /**

@@ -10,6 +10,7 @@ import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.Base64;
+import java.util.regex.Pattern;
 
 @Slf4j
 public class BiliBiliContant {
@@ -17,6 +18,9 @@ public class BiliBiliContant {
     public static final String Format_Error_= "房间号格式有误";
     public static final String Added_Live = "已添加订阅这个房间了";
     public static final String Exception = "发生异常，请检查房间号或者格式是否正确";
+
+    /** CQ 码的起始前缀（大小写不敏感）。只此一种，见 {@link #escapeCq(String)} */
+    private static final Pattern CQ_PREFIX = Pattern.compile("(?i)\\[cq:");
 
     /** 下载图片时用的 UA：B 站图床对空 UA / 非浏览器 UA 不友好 */
     private static final String IMAGE_USER_AGENT =
@@ -26,6 +30,34 @@ public class BiliBiliContant {
     private static final int IMAGE_READ_TIMEOUT = 8000;
     /** 单张图片体积上限，防止异常响应把内存吃爆 */
     private static final int IMAGE_MAX_BYTES = 8 * 1024 * 1024;
+
+    /**
+     * 把<b>第三方文本</b>里可能被当成 CQ 码的片段打残，供拼进将要发送的消息。
+     *
+     * <p><b>为什么必须做</b>：本项目的发送路径是 {@code bot.sendMsg(event, msg, false)} ——
+     * 第三个参数 {@code autoEscape=false} 表示 <b>NapCat 会解析消息串里的 CQ 码</b>
+     * （这正是 {@code MsgUtils#img} 能出图的原因）。而视频标题、评论正文、粉丝牌名这些都是
+     * <b>别人可控的文本</b>：一旦原样拼进去，对方只要写成 {@code [CQ:at,qq=all]}
+     * 就能让我们替他 @全体成员，或塞进任意图片 / 链接。
+     *
+     * <p><b>只打残 {@code [CQ:} 这个前缀，不碰其它方括号</b>。这里踩过一次坑：
+     * 第一版把<b>所有</b> {@code [} 换成全角，结果 B 站评论里遍地都是的表情文本
+     * {@code [doge]} 全变成了 {@code ［doge]} —— 防注入是做到了，但发出去的观感像坏了。
+     * 而 NapCat 只认 {@code [CQ:} 这一个前缀（大小写不敏感），所以只拦它就够，
+     * 其余方括号（表情、颜文字、引用）原样保留。
+     *
+     * <p>⚠️ 这条结论依赖"NapCat 的 CQ 语法只有 {@code [CQ:} 一种开头"这一前提。
+     * 若将来上游支持了别的标记，这里要跟着扩。
+     *
+     * @param text 原始文本，可为 {@code null}
+     * @return 转义后的文本；入参为 {@code null} 时原样返回
+     */
+    public static String escapeCq(String text) {
+        if (text == null || text.isEmpty() || text.indexOf('[') < 0) {
+            return text;
+        }
+        return CQ_PREFIX.matcher(text).replaceAll("［CQ:");
+    }
 
     /**
      * 图片转base64

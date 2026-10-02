@@ -5,7 +5,6 @@ import com.esdllm.mapper.SignInRecordsMapperMysql;
 import com.esdllm.model.SignInRecords;
 import com.esdllm.model.SignInRecordsMysql;
 import com.esdllm.service.SignInRecordsService;
-import jakarta.annotation.PostConstruct;
 import jakarta.annotation.Resource;
 import org.springframework.stereotype.Component;
 
