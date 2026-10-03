@@ -147,6 +147,44 @@ public class LoadDSConfig {
      */
     public static final String KEY_BILI_ANALYSIS_WITH_SUMMARY = "biliAnalysisWithSummary";
 
+    /**
+     * 配置键：<b>ffmpeg 可执行文件路径</b>。留空 = 自动查找
+     * （{@code ./bin/ffmpeg} → PATH，见 {@code FfmpegProvider}）。
+     *
+     * <p><b>什么时候需要它</b>：机器上装了多个 ffmpeg，或者装在了既不在 PATH、也不在
+     * {@code ./bin/} 的地方（比如服务器上手动装的 {@code /opt/ffmpeg/ffmpeg}）。
+     *
+     * <p>⚠️ 给了它就<b>只用它</b>：这个路径跑不起来时<b>不会</b>退回后备（只打一条警告），
+     * 免得出现"我明明指定了，它却偷偷用了另一个版本"。
+     *
+     * <p>⚠️ 该值<b>只在启动时解析一次</b>（避免每次调用都起进程探活），改动需重启生效。
+     */
+    public static final String KEY_BILI_DOWNLOAD_FFMPEG_PATH = "biliDownloadFfmpegPath";
+
+    /**
+     * 配置键：没有可用 ffmpeg 时，<b>是否自动从镜像下载</b>一个静态二进制。默认 <b>开</b>。
+     *
+     * <p><b>为什么默认开</b>（本项目其它开关一律默认关，这个是例外）：这条链路存在的全部意义
+     * 就是让「下载 Release 的 jar 直接启动」成立 —— 默认关掉等于这个能力不存在。
+     * 而它的代价是<b>一次性</b> 28MB 流量（下完落在 {@code ./bin/} 复用，不会反复下），
+     * 且<b>不碰任何 B 站接口</b>，所以不受"默认不多发请求"那条纪律的约束。
+     *
+     * <p><b>什么时候该关</b>：内网/离线环境，或者不想让机器人自己往外下东西。
+     * 关掉后下载类功能直接回"ffmpeg 未就绪"，其它功能完全不受影响。
+     */
+    public static final String KEY_BILI_DOWNLOAD_FFMPEG_AUTO_FETCH = "biliDownloadFfmpegAutoFetch";
+
+    /**
+     * 配置键：ffmpeg 的<b>下载地址</b>，支持 {@code {platform}} 占位符
+     * （取值形如 {@code linux-x64} / {@code win32-x64}）。留空 = 用内置镜像（npmmirror）。
+     *
+     * <p><b>什么时候需要它</b>：镜像站挂了、或者要走自己的内网制品库。
+     *
+     * <p>⚠️ 用了自定义地址就<b>不再校验 SHA256</b> —— 内置摘要只对内置源有意义，
+     * 换了源还对摘要只会"永远校验失败"。此时改为"解压成功 + 能跑 {@code -version}"。
+     */
+    public static final String KEY_BILI_DOWNLOAD_FFMPEG_URL = "biliDownloadFfmpegUrl";
+
     @Value(value = "${bot.qq}")
     Long botQQ;
     @Value(value = "${bot.admin}")
@@ -172,7 +210,7 @@ public class LoadDSConfig {
         if (admin!=null&&admin>0) {
             // 只在缺失时写入。原实现是无条件 save() —— 配了 bot.admin 后每次重启都会多一行，
             // 而 bot.admin 正是"机器人所有者"的声明入口（全局管理员，见 BotAdminChecker）。
-            Long exists = adminService.count(new LambdaQueryWrapper<Admin>()
+            long exists = adminService.count(new LambdaQueryWrapper<Admin>()
                     .eq(Admin::getQqUid, admin)
                     .isNull(Admin::getGroupId));
             if (exists == 0) {
@@ -343,6 +381,28 @@ public class LoadDSConfig {
     }
 
     /**
+     * 与 {@link #isEnabled(String)} 同口径，但可以指定<b>键缺失时的默认值</b>。
+     *
+     * <p>唯一的差别是"没配"这一格的答案：那个是 fail-closed（缺失即关），
+     * 这个允许「默认开」。<b>有值时两者判定完全一致</b>（只有 {@code true/1/on/yes} 算开）
+     * —— 所以显式写 {@code 0} / {@code false} 照样能把它关掉，不会出现"默认开就关不掉"的怪事。
+     *
+     * <p>用途：像 {@link #KEY_BILI_DOWNLOAD_FFMPEG_AUTO_FETCH} 这种
+     * "开了才是它本来该有的样子"的开关。
+     *
+     * @param key          配置键（用本类里的 {@code KEY_*} 常量）
+     * @param defaultValue 键缺失或空白时的取值
+     * @return 是否开启
+     */
+    public boolean isEnabled(String key, boolean defaultValue) {
+        String raw = configMap.get(key);
+        if (raw == null || raw.isBlank()) {
+            return defaultValue;
+        }
+        return isEnabled(key);
+    }
+
+    /**
      * 更新数据库中的配置
      * @param key 配置键
      * @param value 配置值
@@ -413,6 +473,15 @@ public class LoadDSConfig {
             log.info("视频解析附带 AI 摘要已{}（开启后单次解析的 B 站请求数 1 → 2）；当前{}",
                     on ? "开启" : "关闭",
                     HttpPolicy.hasCookie() ? "已配置 Cookie，可生效" : "未配置 Cookie ⇒ 该项不会生效");
+        } else if (KEY_BILI_DOWNLOAD_FFMPEG_AUTO_FETCH.equals(key)) {
+            log.info("ffmpeg 自动获取已{}（关闭后：本机没有 ffmpeg 时不再自动下载，"
+                            + "下载类功能不可用，其它功能不受影响）",
+                    isEnabled(key, true) ? "开启" : "关闭");
+        } else if (KEY_BILI_DOWNLOAD_FFMPEG_PATH.equals(key)) {
+            log.info("ffmpeg 路径已设为 [{}]（⚠️ 该值只在启动时解析一次，重启后生效）", configMap.get(key));
+        } else if (KEY_BILI_DOWNLOAD_FFMPEG_URL.equals(key)) {
+            log.info("ffmpeg 下载地址已设为 [{}]（⚠️ 自定义地址不做 SHA256 校验，改为「解压 + 能跑」判定）",
+                    configMap.get(key));
         }
     }
 
