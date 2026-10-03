@@ -2,6 +2,7 @@ package com.esdllm.botPlugins;
 
 import com.esdllm.bilibiliApi.http.HttpPolicy;
 import com.esdllm.common.BotAdminChecker;
+import com.esdllm.common.CookieUtils;
 import com.esdllm.config.LoadDSConfig;
 import com.esdllm.service.CredentialGuard;
 import com.mikuac.shiro.annotation.AnyMessageHandler;
@@ -52,23 +53,22 @@ import java.util.regex.Pattern;
  * —— 那是<b>出口 IP 被标记</b>，换出口是唯一的软件侧出路。详见
  * {@link LoadDSConfig#KEY_BILI_PROXY}。
  *
- * <p><b>权限模型</b>：这里的操作都是<b>全局</b>的（换 Cookie / 换出口会影响所有群、所有订阅），
- * 所以只认 {@code admin} 表白名单（{@code common/BotAdminChecker#isBotAdmin}）：
- * <b>群主/群管理员这类平台身份不算</b>，<b>私聊也不再默认放行</b>
- * —— 否则任何能给机器人发私信的人都能改全局凭据。
+ * <p><b>权限模型</b>：这里的操作都是<b>全局</b>的（换 Cookie / 换出口 / 改开关会影响所有群、
+ * 所有订阅），所以只认<b>机器人所有者</b>
+ * （{@code common/BotAdminChecker#isBotOwner}：{@code admin} 表里 {@code qq_uid} 匹配
+ * <b>且</b> {@code group_id} 为空的那一条）：
+ * <b>群主/群管理员这类平台身份不算</b>，<b>「按群授权」的管理员也不算</b>，
+ * <b>私聊也不再默认放行</b> —— 否则任何能给机器人发私信的人都能改全局凭据。
  *
  * <p>⚠️ <b>新增命令一律走 {@link #guard}</b>：权限判定与异常兜底都在那里，
  * 各 handler 不要再自己写一遍（原先有 7 份拷贝，而且都没有 {@code catch}）。
  *
- * <p><b>⚠️ 这里刻意用 {@code isBotAdmin}，而不是 {@code BiliLoginPlugins} 用的
- * {@code isBotOwner}</b>：两者是<b>不同口径</b>，不是同一条口径的松紧两档。
- * <ul>
- *   <li>本插件的「设置cookie / 设置代理」= <b>配置</b>：管理员交出的是一份
- *       <b>他自己已经持有</b>的凭据或出口，属于运维动作 ⇒ 机器人管理员即可。</li>
- *   <li>{@code 登录} = <b>授权转移</b>：二维码谁扫到、机器人就以<b>谁</b>的账号出站，
- *       发起方与受益方可以不是同一个人 ⇒ 只给所有者。</li>
- * </ul>
- * 两个插件的判定<b>不要"顺手统一"</b>，语义不同（详见 {@code BotAdminChecker} 的类注释）。
+ * <p><b>为什么是"所有者"而不是"机器人管理员"</b>：全局配置改的是<b>整个机器人共用</b>的
+ * 凭据与出口，影响面 = 所有群 + 所有订阅，写坏了也只能由所有者收拾 ⇒ 与
+ * {@code BiliLoginPlugins} 的「登录」取<b>同一档</b>。早先这里用的是 {@code isBotAdmin}
+ * （只按 {@code qq_uid} 命中 {@code admin} 表），它的覆盖面包含「按群授权」的记录
+ * （{@code group_id} 有值）—— 等于把"他在某个群当管理员"放大成
+ * "他能改整个机器人的出站身份"：<b>越想收窄授权，实际越放大权限</b>。
  *
  * <p><b>安全约定</b>：
  * <ul>
@@ -382,10 +382,10 @@ public class BiliConfigPlugins {
      * （想让某条视频解析多带点信息、想临时把请求量压下来），为一次开关去连服务器改库不划算。
      * 这里给一条命令，<b>改完即时生效、不用重启</b>（取值都是每次现读 configMap）。
      *
-     * <p><b>为什么权限用 {@code isBotAdmin}</b>：这几个开关是<b>全局</b>的（影响所有群、所有订阅的
-     * 请求量），与「设置cookie / 设置代理」同一性质 ⇒ 同一口径，只认 {@code admin} 表白名单。
+     * <p><b>为什么权限顶格到"所有者"</b>：这几个开关是<b>全局</b>的（影响所有群、所有订阅的
+     * 请求量），与「设置cookie / 设置代理」同一性质 ⇒ 同一口径，只认机器人所有者。
      *
-     * <p><b>权限</b>：与「设置cookie / 设置代理」同口径（{@code isBotAdmin}），
+     * <p><b>权限</b>：与「设置cookie / 设置代理」同口径（{@code BotAdminChecker#isBotOwner}），
      * 由 {@link #guard} 统一判定并兜住异常。
      */
     @AnyMessageHandler
@@ -435,7 +435,7 @@ public class BiliConfigPlugins {
                             + "（也接受 on/off、true/false、1/0、启用/禁用）。收到：" + rawValue);
                     return;
                 }
-                value = bool ? "true" : "false";
+                value = bool.toString();
             }
             case INT -> {
                 try {
@@ -495,8 +495,10 @@ public class BiliConfigPlugins {
             option.valueNotes().forEach((value, note) ->
                     sb.append("      ").append(value).append(" = ").append(note).append("\n"));
         }
-        sb.append("\n改：开关 <名称> <值>　例：开关 热评 开 ｜ 开关 摘要 关 ｜ 开关 动态源 follow"
-                + "\n查单项：开关 热评");
+        sb.append("""
+                
+                改：开关 <名称> <值>　例：开关 热评 开 ｜ 开关 摘要 关 ｜ 开关 动态源 follow
+                查单项：开关 热评""");
         return sb.toString();
     }
 
@@ -778,14 +780,7 @@ public class BiliConfigPlugins {
     }
 
     private static String join(Map<String, String> pairs) {
-        StringBuilder sb = new StringBuilder();
-        for (Map.Entry<String, String> entry : pairs.entrySet()) {
-            if (sb.length() > 0) {
-                sb.append("; ");
-            }
-            sb.append(entry.getKey()).append('=').append(entry.getValue());
-        }
-        return sb.toString();
+        return CookieUtils.join(pairs);
     }
 
     /**
@@ -818,15 +813,17 @@ public class BiliConfigPlugins {
     /**
      * 权限不足的提示。
      *
-     * <p>刻意写明"群主/群管理员不够"：这套判定与 QQ 群的平台身份无关，
-     * 只有 {@code admin} 表白名单里的人才能改全局配置。
+     * <p>刻意写明"什么身份不算"：这套判定与 QQ 群的平台身份无关，也不认「按群授权」的管理员，
+     * 只有 {@code admin} 表里 {@code group_id} 为空的那一条（= {@code bot.admin}）能改全局配置。
      */
     private static String denyMessage() {
-        return "你没有权限改这个配置。\n"
-                + "B 站 Cookie / 代理会影响整个机器人（动态推送），只允许 admin 表里的管理员修改。\n"
-                + "（群主 / 群管理员身份不算，私聊也不例外）\n"
-                + "加人方式：application.yaml 里把 bot.admin 设成你的 QQ，"
-                + "或手工往 admin 表加一行 qq_uid=你的QQ。";
+        return """
+                你没有权限改这个配置。
+                B 站 Cookie / 代理 / 开关是整个机器人共用的（影响所有群、所有订阅），\
+                只允许机器人所有者修改。
+                （群主 / 群管理员不算，「按群授权」的管理员也不算，私聊也不例外）
+                成为所有者的方式：application.yaml（或启动参数）把 bot.admin 设成你的 QQ，\
+                或手工往 admin 表加一行 qq_uid=你的QQ、group_id 留空。""";
     }
 
     /**
@@ -836,7 +833,7 @@ public class BiliConfigPlugins {
      * <ol>
      *   <li><b>口径只有一份</b>：以后调权限只需改这里，不会出现"改漏了某条命令"；</li>
      *   <li><b>安全判定要 fail-closed</b>：权限不足要明确回复；<b>拿不准也按无权限处理</b>
-     *       —— 所以连 {@code isBotAdmin} 自己抛异常都归到"拒绝"这一支；</li>
+     *       —— 所以连 {@code isBotOwner} 自己抛异常都归到"拒绝"这一支；</li>
      *   <li><b>异常不能穿出 handler</b>：原先这里一个 {@code catch} 都没有 —— 处理中一旦抛异常，
      *       消息处理链路就断了，<b>用户什么回复都收不到</b>，只能靠翻日志猜。</li>
      * </ol>
@@ -850,7 +847,7 @@ public class BiliConfigPlugins {
      */
     private boolean guard(Bot bot, AnyMessageEvent event, Runnable action) {
         try {
-            if (!botAdminChecker.isBotAdmin(event)) {
+            if (!botAdminChecker.isBotOwner(event)) {
                 send(bot, event, denyMessage());
                 return false;
             }

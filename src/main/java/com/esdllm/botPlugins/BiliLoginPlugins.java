@@ -52,14 +52,12 @@ import java.util.concurrent.atomic.AtomicLong;
  * 本插件提供"不用手工"的获取路径，两者写的是同一个配置键，都会即时生效。
  * 合并口径统一走 {@link CookieUtils}。
  *
- * <p><b>⚠️ 但两个插件的权限口径不同，不要"顺手统一"</b>：本插件（{@code 登录}）用
- * {@link BotAdminChecker#isBotOwner}，那个插件（{@code 设置cookie / 设置代理}）用
- * {@link BotAdminChecker#isBotAdmin}。区别在于动作性质：
- * <ul>
- *   <li>{@code 设置cookie} 是<b>配置</b> —— 管理员交出的凭据是他<b>自己已经持有</b>的；</li>
- *   <li>{@code 登录} 是<b>授权转移</b> —— 二维码谁扫到，机器人就以<b>谁</b>的账号出站，
- *       本插件的 {@code loginEpoch} 也只能作废上一轮，管不了"谁扫的"。</li>
- * </ul>
+ * <p><b>权限口径与 {@code BiliConfigPlugins} 一致</b>：两边都用
+ * {@link BotAdminChecker#isBotOwner}（{@code admin} 表里 {@code group_id} 为空的那条）。
+ * 共同点是"影响全局"——那个插件的 {@code 设置cookie / 设置代理 / 开关} 改的是整个机器人
+ * 共用的凭据与出口，而 {@code 登录} 更极端：二维码谁扫到，机器人就以<b>谁</b>的账号出站，
+ * 本插件的 {@code loginEpoch} 也只能作废上一轮、管不了"谁扫的"。
+ * 所以两组都<b>只给所有者</b>，「按群授权」的管理员不算。
  */
 @Slf4j
 @Component
@@ -125,8 +123,8 @@ public class BiliLoginPlugins {
     @MessageHandlerFilter(cmd = CMD_LOGIN, at = AtEnum.BOTH)
     public void login(Bot bot, AnyMessageEvent event) {
         try {
-            // ★ 所有者（admin 表里 group_id 为空的那条），不是 isBotAdmin：
-            //   扫码登录是"夺取全局 B 站身份"，比改 Cookie 还顶格，只给所有者。
+            // ★ 所有者（admin 表里 group_id 为空的那条）：扫码登录是"夺取全局 B 站身份"，
+            //   与 BiliConfigPlugins 的全局配置同一档，只给所有者。
             if (!botAdminChecker.isBotOwner(event)) {
                 send(bot, event, denyMessage());
                 return;
@@ -376,9 +374,10 @@ public class BiliLoginPlugins {
      * 他们能在某个群里管事，不等于能把机器人的全局出站身份交出去。
      */
     private static String denyMessage() {
-        return "你没有权限执行这个操作。\n"
-                + "扫码登录会把机器人的 B 站出站身份换成扫码者本人的账号，"
-                + "影响所有群、所有订阅的推送，因此只允许机器人所有者使用。\n"
-                + "（群主 / 群管理员 / 按群授权的管理员都不算）";
+        return """
+                你没有权限执行这个操作。
+                扫码登录会把机器人的 B 站出站身份换成扫码者本人的账号，\
+                影响所有群、所有订阅的推送，因此只允许机器人所有者使用。
+                （群主 / 群管理员 / 按群授权的管理员都不算）""";
     }
 }

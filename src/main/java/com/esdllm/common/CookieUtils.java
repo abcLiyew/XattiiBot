@@ -77,7 +77,7 @@ public final class CookieUtils {
     public static String join(Map<String, String> pairs) {
         StringBuilder sb = new StringBuilder();
         for (Map.Entry<String, String> entry : pairs.entrySet()) {
-            if (sb.length() > 0) {
+            if (!sb.isEmpty()) {
                 sb.append("; ");
             }
             sb.append(entry.getKey()).append('=').append(entry.getValue());
