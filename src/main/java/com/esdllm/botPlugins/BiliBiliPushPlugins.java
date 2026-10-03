@@ -250,7 +250,7 @@ public class BiliBiliPushPlugins {
     }
     private void sendMsd(Bot bot, AnyMessageEvent event, PushInfoResp pushAdd) {
         String sendMsg = MsgUtils.builder().at(event.getUserId())
-                .text("添加订阅 " + pushAdd.getName() + " 成功!\n" +
+                .text("添加订阅 " + BiliBiliContant.escapeCq(pushAdd.getName()) + " 成功!\n" +
                         (!pushAdd.getLivePush() ? "直播推送" : "") +
                         (!pushAdd.getDynamicPush() ? (pushAdd.getLivePush() ? "和动态推送" : "动态推送") + "关闭" : ""))
                 .build();
@@ -262,7 +262,9 @@ public class BiliBiliPushPlugins {
     }
 
     private void sendErrorMessage(Bot bot, AnyMessageEvent event, String errorMessage) {
-        sendMessage(bot, event, MsgUtils.builder().at(event.getUserId()).text(errorMessage).build());
+        // errorMessage 里会带 e.getMessage()（服务端原文）⇒ 转义后再拼
+        sendMessage(bot, event, MsgUtils.builder().at(event.getUserId())
+                .text(BiliBiliContant.escapeCq(errorMessage)).build());
     }
 
     private void sendSuccessMessage(Bot bot, AnyMessageEvent event) {

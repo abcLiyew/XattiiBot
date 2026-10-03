@@ -33,6 +33,7 @@ import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -73,6 +74,22 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
      * 而这张表本来就是通用的 KV，加一个键零迁移、且用户可以直接用 SQL 查看/清空。
      */
     private final Map<Long, Set<String>> pushedDynamicIds = new ConcurrentHashMap<>();
+
+    /**
+     * 保护 {@link #pushedDynamicIds} 里每个 Set 的锁。
+     *
+     * <p><b>为什么不直接用 Set 自己当锁</b>（原来是 {@code synchronized (pushed)} /
+     * {@code synchronized (ids)}）：那把锁的<b>身份是从 map 里取出来的</b> ——
+     * {@link #loadPushedIds} 的 {@code putAll} 就能把 entry 的值换成新实例，
+     * 于是两个线程各自锁在"不同的对象"上，互斥悄悄失效；
+     * 而且 {@link #alreadyPushed} 那条读路径当时<b>根本没加锁</b>。
+     * 换成一把固定对象的锁之后，纪律只剩一条：<b>碰这些 Set 就先进这把锁</b>。
+     *
+     * <p>粒度从"每个 Set 一把"变成"全局一把"是<b>故意的</b>：这几个操作都只在动态推送一轮里
+     * 跑几十次、每次是纯内存操作，串行化的代价可以忽略；换来的是不必再逐点推敲
+     * "这把锁和那把锁是不是同一个对象"。
+     */
+    private final Object pushedIdsLock = new Object();
 
     /**
      * 进程启动时刻（毫秒），只用于冷启动判定，见 {@link #isColdStartBacklog}。
@@ -137,16 +154,28 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
      */
     private volatile long riskCooldownUntil = 0L;
 
-    /** 连续失败的轮数，用于让冷却时长递增（1 → 2 → 4 → 8 分钟封顶） */
-    private volatile int consecutiveFailures = 0;
+    /**
+     * 连续失败的轮数，用于让冷却时长递增（1 → 2 → 4 → 8 分钟封顶）。
+     *
+     * <p><b>为什么是 {@link AtomicInteger} 而不是 {@code volatile int}</b>：这个字段要做
+     * {@code min(v + 1, 16)} 这种<b>读-改-写</b>，而 {@code volatile} 只保证可见性、
+     * <b>不保证复合操作原子</b> —— 写出来是"看着线程安全、其实不是"。
+     * 目前写入确实被动态推送的重入闸（{@code BiliBiliPushPlugins#dynamicPushRunning}）收敛成单写者，
+     * 但那是<b>另一个类的调用约定</b>：{@link #dynamicPush} 是 public 接口方法，
+     * 换个入口（手动触发、测试、将来的命令）就能并发进来，不该把正确性押在那上面。
+     */
+    private final AtomicInteger consecutiveFailures = new AtomicInteger(0);
 
     /**
      * 已经打过完整堆栈的失败轮数计数（见 {@link #logFetchFailure}）。
      *
      * <p>风控持续期间每轮都会失败，若每次都打 20 行堆栈，日志会被淹掉、真正有用的
      * "出站身份 / 策略"那几行反而看不见。所以只在第 1 次和每 10 次打完整堆栈，其余打一行。
+     *
+     * <p>同样用 {@link AtomicInteger} 而非 {@code volatile int}（理由见 {@link #consecutiveFailures}）：
+     * 它要自增，而且"自增后的值"必须与随后打日志用的值是<b>同一个</b>。
      */
-    private volatile int failuresLogged = 0;
+    private final AtomicInteger failuresLogged = new AtomicInteger(0);
 
 
     /**
@@ -623,10 +652,12 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
             }
         } else {
             // 整轮都拿到了列表 → 说明数据源是通的，把递增计数清零
-            failuresLogged = 0;
-            if (consecutiveFailures != 0) {
-                log.info("动态推送恢复正常（此前连续失败 {} 轮）", consecutiveFailures);
-                consecutiveFailures = 0;
+            failuresLogged.set(0);
+            // getAndSet：一次完成"取旧值 + 清零"，日志里打的就是<b>清零前</b>那个轮数
+            //（原先先 if 读一次、再 log 读一次、再赋值，同一字段被访问三次）
+            int recoveredAfter = consecutiveFailures.getAndSet(0);
+            if (recoveredAfter != 0) {
+                log.info("动态推送恢复正常（此前连续失败 {} 轮）", recoveredAfter);
             }
         }
     }
@@ -820,13 +851,15 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
      * @param e   异常
      */
     private void logFetchFailure(Long uid, Exception e) {
-        failuresLogged++;
+        // 自增与"取来用"必须是同一个值：原来写的是先 ++ 再读两次字段，
+        // 读与读之间理论上可能被改写，日志里的"第 N 次"也可能对不上。
+        int times = failuresLogged.incrementAndGet();
         String reason = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
-        if (failuresLogged == 1 || failuresLogged % 10 == 0) {
+        if (times == 1 || times % 10 == 0) {
             log.error("获取动态列表失败（第 {} 次），本轮跳过 uid={}（该 uid 的其它订阅一并跳过）",
-                    failuresLogged, uid, e);
+                    times, uid, e);
         } else {
-            log.warn("获取动态列表失败（第 {} 次），本轮跳过 uid={}：{}", failuresLogged, uid, reason);
+            log.warn("获取动态列表失败（第 {} 次），本轮跳过 uid={}：{}", times, uid, reason);
         }
     }
 
@@ -840,12 +873,14 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
      * 被 {@link #isFresh(String)} 判成不新鲜而永久漏推（这一点有注释约束，改参数时别只改一处）。
      */
     private void enterRiskCooldown() {
-        consecutiveFailures = Math.min(consecutiveFailures + 1, 16);
-        long delay = Math.min(RISK_COOLDOWN_BASE_MS << (consecutiveFailures - 1), RISK_COOLDOWN_MAX_MS);
+        // updateAndGet：自增（封顶 16）与取回是同一个原子操作；delay 与日志用<b>同一个</b>轮数，
+        // 不再"读完再读一次"（原写法里 delay 用的是字段的第二次读取，理论上可能与日志里的不一致）
+        int rounds = consecutiveFailures.updateAndGet(v -> Math.min(v + 1, 16));
+        long delay = Math.min(RISK_COOLDOWN_BASE_MS << (rounds - 1), RISK_COOLDOWN_MAX_MS);
         riskCooldownUntil = System.currentTimeMillis() + delay;
         log.warn("动态推送连续失败 {} 轮，冷却 {} 秒后再试（让 B 站惩罚窗口自然过期；"
                         + "上限 {} 分钟，短于新鲜窗口 {} 分钟，所以不会因此漏推）",
-                consecutiveFailures, delay / 1000, RISK_COOLDOWN_MAX_MS / 60000, RECENT_MINUTES);
+                rounds, delay / 1000, RISK_COOLDOWN_MAX_MS / 60000, RECENT_MINUTES);
     }
 
     /**
@@ -857,7 +892,15 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
      */
     private boolean alreadyPushed(Long pid, String dynamicKey) {
         Set<String> pushed = pushedDynamicIds.get(pid);
-        return pushed != null && pushed.contains(dynamicKey);
+        if (pushed == null) {
+            return false;
+        }
+        // ⚠️ 这条读路径原先<b>没有任何同步</b>：LinkedHashSet 不是线程安全的，
+        //    而 markPushed 会在锁内 add/remove ⇒ 并发 contains 可能撞上正在改的链表。
+        //    与 markPushed / serializePushedIds 共用同一把锁（见 #pushedIdsLock）。
+        synchronized (pushedIdsLock) {
+            return pushed.contains(dynamicKey);
+        }
     }
 
     /**
@@ -868,9 +911,9 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
      */
     private void markPushed(Long pid, String dynamicKey) {
         Set<String> pushed = pushedDynamicIds.computeIfAbsent(pid, k -> new LinkedHashSet<>());
-        // 同一个 pid 只会被动态推送的一个线程访问（@Async + AtomicBoolean 重入闸），
-        // 但配置热更新等路径可能并读，所以这里对集合本身加锁，代价可忽略。
-        synchronized (pushed) {
+        // 锁的是 #pushedIdsLock（固定对象），不是 pushed 本身 —— 理由见那个字段的注释：
+        // 用 Set 当锁，锁的身份就跟着 map 里的值走，loadPushedIds 的 putAll 一换实例就失效。
+        synchronized (pushedIdsLock) {
             if (pushed.size() >= PUSHED_HISTORY_PER_SUB) {
                 Iterator<String> it = pushed.iterator();
                 if (it.hasNext()) {
@@ -896,7 +939,11 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
     public void loadPushedIds() {
         String raw = loadDSConfig.getConfigMap().get(LoadDSConfig.KEY_PUSHED_DYNAMIC_IDS);
         Map<Long, Set<String>> loaded = parsePushedIds(raw);
-        pushedDynamicIds.putAll(loaded);
+        // 启动期其实还没有并发访问，仍然持锁 —— 目的是让"碰这些 Set 就先进这把锁"
+        // 成为一条<b>没有例外</b>的纪律，而不是"大部分地方记得加锁"。
+        synchronized (pushedIdsLock) {
+            pushedDynamicIds.putAll(loaded);
+        }
 
         for (PushInfo pushInfo : pushInfoMapper.selectList(null)) {
             Long pid = pushInfo.getPid();
@@ -959,11 +1006,13 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
     private String serializePushedIds() {
         StringBuilder sb = new StringBuilder();
         pushedDynamicIds.forEach((pid, ids) -> {
-            if (ids.isEmpty()) {
-                return;
-            }
-            synchronized (ids) {
-                if (sb.length() > 0) {
+            // 判空也放进锁内：原来 isEmpty() 在锁外读 LinkedHashSet 的 size（非 volatile），
+            // 与 markPushed 的增删构成 data race。既然都要拿锁，就没必要留这条缝。
+            synchronized (pushedIdsLock) {
+                if (ids.isEmpty()) {
+                    return;
+                }
+                if (!sb.isEmpty()) {
                     sb.append('|');
                 }
                 sb.append(pid).append('=').append(String.join(",", ids));
@@ -1075,6 +1124,8 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
      * @throws IOException I/O异常
      */
     private void sendMsg(String username,Dynamic dynamic,Dynamic.DynamicInfo dynamicInfo,Bot bot,PushInfo pushInfo) throws InterruptedException, IOException {
+        // UP 主昵称是第三方可控文本（他自己起的），而发送参数 autoEscape=false ⇒ 必须转义
+        username = BiliBiliContant.escapeCq(username);
         String sendMsg = "";
         BilibiliClient bilibiliClient = new BilibiliClient();
         // 注意：下面三段必须互斥（else if）。原来写成三个独立 if 时是**顺序覆盖**：
@@ -1093,8 +1144,8 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
             }
             sendMsg = builder
                     .text("av"+bilibiliClient.getVideoAv(dynamicInfo.getBvid())+"\n"+dynamicInfo.getBvid()+
-                          "标题："+  bilibiliClient.getVideoTitle(dynamicInfo.getBvid())+"\n"+
-                          "简介："+ bilibiliClient.getVideoDesc(dynamicInfo.getBvid())+"\n\n"+
+                          "标题："+  BiliBiliContant.escapeCq(bilibiliClient.getVideoTitle(dynamicInfo.getBvid()))+"\n"+
+                          "简介："+ BiliBiliContant.escapeCq(bilibiliClient.getVideoDesc(dynamicInfo.getBvid()))+"\n\n"+
                           "https://www.bilibili.com/video/"+dynamicInfo.getBvid()
                     ).build();
         } else if (dynamicInfo.getShareDynamicId()!= null){
@@ -1228,9 +1279,11 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
      * 构建@全体成员的开播消息
      */
     private String buildAtAllLiveMessage(String userName, LiveRoom room, String liveUrl) throws IOException {
+        // 这条消息带 atAll()：主播昵称/直播标题不转义 = 把「@全体成员」的能力交出去
+        userName = BiliBiliContant.escapeCq(userName);
         return MsgUtils.builder().atAll()
                 .text(" " + userName + " 开播了" +
-                        "\n标题：" + room.getTitle() + "\n" +
+                        "\n标题：" + BiliBiliContant.escapeCq(room.getTitle()) + "\n" +
                         "分区：" + room.getArea_name() + "\n" +
                         "地址：" + liveUrl + "\n")
                 .img(room.getUser_cover())
@@ -1241,6 +1294,7 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
      * 构建@特定用户的开播消息
      */
     private String buildAtUserLiveMessage(List<Long> atListStr, String userName, LiveRoom room, String liveUrl) throws IOException {
+        userName = BiliBiliContant.escapeCq(userName);
         StringBuilder msgBuilder = new StringBuilder();
         for (Long aLong : atListStr) {
             msgBuilder.append(MsgUtils.builder().at(aLong).build());
@@ -1248,7 +1302,7 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
 
         return msgBuilder + MsgUtils.builder().text(" " +
                         userName + " 开播了" +
-                        "\n标题：" + room.getTitle() + "\n" +
+                        "\n标题：" + BiliBiliContant.escapeCq(room.getTitle()) + "\n" +
                         "分区：" + room.getArea_name() + "\n" +
                         "地址：" + liveUrl + "\n" +
                         "[CQ:image,file=" + room.getUser_cover() + "]")
@@ -1259,9 +1313,10 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
      * 构建普通开播消息
      */
     private String buildNormalLiveMessage(String userName, LiveRoom room, String liveUrl) throws IOException {
+        userName = BiliBiliContant.escapeCq(userName);
         return MsgUtils.builder()
                 .text(" " + userName + " 开播了" +
-                        "\n标题：" + room.getTitle() + "\n" +
+                        "\n标题：" + BiliBiliContant.escapeCq(room.getTitle()) + "\n" +
                         "分区：" + room.getArea_name() + "\n" +
                         "地址：" + liveUrl +"?live_from="+(int)(Math.random()*10000)+"&spm_id_from=333.1007.top_right_bar_window_dynamic.content.click"+ "\n" +
                         "[CQ:image,file=" + room.getUser_cover() + "]")
@@ -1272,6 +1327,7 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
      * 构建下播消息
      */
     private String buildLiveEndMessage(PushInfo pushInfo, String userName) {
+        userName = BiliBiliContant.escapeCq(userName);
         long now = System.currentTimeMillis();
         long between = now - pushInfo.getLiveTime();
         long hour = (between / (60 * 60 * 1000));

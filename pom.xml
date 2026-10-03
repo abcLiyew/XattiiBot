@@ -105,11 +105,10 @@
             <artifactId>druid-spring-boot-3-starter</artifactId>
             <version>1.2.23</version>
         </dependency>
-        <dependency>
-            <groupId>com.baomidou</groupId>
-            <artifactId>dynamic-datasource-spring-boot-starter</artifactId>
-            <version>4.3.1</version>
-        </dependency>
+        <!-- 这里原先还有一份 dynamic-datasource-spring-boot-starter（Boot 2 坐标）。
+             2026-10-03 去重：本工程是 Boot 3，只需要上面那个 spring-boot3-starter；
+             两份同名 starter 同时在类路径上会各自带一份自动配置。
+             ⚠️ 去重后请核对打包产物里 dynamic-datasource-* 只剩一套（见 memory 记录）。 -->
         <!-- 驱动类-->
         <dependency>
             <groupId>com.mysql</groupId>
@@ -152,11 +151,10 @@
             <artifactId>httpclient</artifactId>
             <version>4.5.13</version>
         </dependency>
-        <dependency>
-            <groupId>com.alibaba</groupId>
-            <artifactId>fastjson</artifactId>
-            <version>1.2.83</version>
-        </dependency>
+        <!-- 这里原先声明了 com.alibaba:fastjson:1.2.83。2026-10-03 移除，理由是两条都实测过：
+             ① 全仓源码对它 0 引用（grep 只命中 pom 自身）；
+             ② bilibili-api 0.10.0 已切 fastjson2，真正需要的是 fastjson2（由它传递提供）。
+             删掉后 fastjson-1.2.83.jar 不再进、fastjson2-2.0.56.jar 照旧在。 -->
         <!-- Pull in as a traditional dependency -->
         <dependency>
             <groupId>com.konghq</groupId>

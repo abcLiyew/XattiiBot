@@ -244,8 +244,8 @@ public class BilibiliAnalysisImpl implements BilibiliAnalysis {
         }
         builder = builder.text(
                 "专栏 cv" + cvId + "\n" +
-                        "标题：" + info.getTitle() + "\n" +
-                        "作者：" + info.getAuthor_name() + "（uid " + info.getMid() + "）\n" +
+                        "标题：" + BiliBiliContant.escapeCq(info.getTitle()) + "\n" +
+                        "作者：" + BiliBiliContant.escapeCq(info.getAuthor_name()) + "（uid " + info.getMid() + "）\n" +
                         (stats == null
                                 ? "（服务端未返回统计数据）\n"
                                 : "阅读：" + NumFormat.count(stats.getView())
@@ -293,7 +293,7 @@ public class BilibiliAnalysisImpl implements BilibiliAnalysis {
                 return;
             }
             String base64Image = BiliBiliContant.imgToBase64(dynamicImg);
-            String sendMsg = MsgUtils.builder().text(card.getDesc().getUser_profile().getInfo().getUname()+" 的动态：\n")
+            String sendMsg = MsgUtils.builder().text(BiliBiliContant.escapeCq(card.getDesc().getUser_profile().getInfo().getUname())+" 的动态：\n")
                     .img("base64://"+base64Image).text("https://www.bilibili.com/opus/"+card.getDesc().getDynamic_id_str())
                     .build();
             bot.sendMsg(event,sendMsg,false);
@@ -342,11 +342,11 @@ public class BilibiliAnalysisImpl implements BilibiliAnalysis {
         MsgUtils builder = MsgUtils.builder().img(info.getPic()).text(
                 "av" + info.getAid() + "\n" +
                         info.getBvid() + "\n" +
-                        "标题：" + info.getTitle() + "\n" +
-                        "简介：" + info.getDesc() + "\n" +
+                        "标题：" + BiliBiliContant.escapeCq(info.getTitle()) + "\n" +
+                        "简介：" + BiliBiliContant.escapeCq(info.getDesc()) + "\n" +
                         "上传时间：" + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(info.getPubdate() * 1000) + "\n" +
                         statText +
-                        "\nup主：" + info.getOwner().getName() + "\n" + "up主uid：" + info.getOwner().getMid() + "\n" +
+                        "\nup主：" + BiliBiliContant.escapeCq(info.getOwner().getName()) + "\n" + "up主uid：" + info.getOwner().getMid() + "\n" +
                         getStaff(info.getStaff())
         );
         // ★ P2-7：AI 摘要。**默认关**（开关见 LoadDSConfig#KEY_BILI_ANALYSIS_WITH_SUMMARY）。
@@ -624,7 +624,7 @@ public class BilibiliAnalysisImpl implements BilibiliAnalysis {
             if (count > 0) {
                 sb.append(" / ");
             }
-            sb.append(tag.getTag_name());
+            sb.append(BiliBiliContant.escapeCq(tag.getTag_name()));
             count++;
         }
         return count == 0 ? "" : sb.toString();
@@ -644,10 +644,10 @@ public class BilibiliAnalysisImpl implements BilibiliAnalysis {
             if (count >= MAX_RELATED) {
                 break;
             }
-            sb.append("\n").append(count + 1).append(". ").append(brief.getTitle());
+            sb.append("\n").append(count + 1).append(". ").append(BiliBiliContant.escapeCq(brief.getTitle()));
             String upName = brief.getOwner() == null ? null : brief.getOwner().getName();
             if (upName != null && !upName.isBlank()) {
-                sb.append("（").append(upName);
+                sb.append("（").append(BiliBiliContant.escapeCq(upName));
                 Long relatedView = brief.getStat() == null ? null : brief.getStat().getView();
                 if (relatedView != null) {
                     sb.append(" · ").append(NumFormat.count(relatedView));
@@ -667,8 +667,8 @@ public class BilibiliAnalysisImpl implements BilibiliAnalysis {
         String msg = MsgUtils.builder()
                 .text(
                         "房间号："+liveRoom.getRoom_id()+"\n"+
-                                "标题："+liveRoom.getTitle()+"\n"+
-                                "up主："+cardInfo.getUserName(liveRoom.getUid())+"\n"+
+                                "标题："+BiliBiliContant.escapeCq(liveRoom.getTitle())+"\n"+
+                                "up主："+BiliBiliContant.escapeCq(cardInfo.getUserName(liveRoom.getUid()))+"\n"+
                                 "up主uid："+liveRoom.getUid()+"\n"+
                                 masterText+
                                 "观看人数："+liveRoom.getOnline()+"\n"+
@@ -737,7 +737,7 @@ public class BilibiliAnalysisImpl implements BilibiliAnalysis {
             if (s==null||s.getName()==null){
                 continue;
             }
-            str.append(s.getName()).append(",");
+            str.append(BiliBiliContant.escapeCq(s.getName())).append(",");
         }
         if (str.length()==prefix.length()){
             return "";
