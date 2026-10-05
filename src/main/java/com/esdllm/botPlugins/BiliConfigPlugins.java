@@ -20,6 +20,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 /**
@@ -45,8 +46,9 @@ import java.util.regex.Pattern;
  * 清除代理                                       ← 恢复直连
  *
  * 开关                                           ← 列出所有功能开关
- * 开关 热评 开                                   ← 改一项（热评/主播/摘要/动态源/探测间隔）
+ * 开关 热评 开                                   ← 改一项（热评/主播/摘要/动态源/探测间隔/录播网页…）
  * 开关 探期间隔 12                                ← 数字项直接给值
+ * 开关 录播网页基址 https://rec.example.com       ← 文本项直接给值（发「自动」可清空）
  * </pre>
  *
  * <p><b>什么时候需要配代理</b>：Cookie 完全正确（日志里"出站身份"的键名齐全）却仍持续 412
@@ -111,6 +113,34 @@ public class BiliConfigPlugins {
     private static final Pattern TOKEN_SPLIT = Pattern.compile("[\\s;]+");
     /** 合法的 Cookie 键名 */
     private static final Pattern KEY_PATTERN = Pattern.compile("^[A-Za-z0-9_.\\-]{1,40}$");
+
+    /**
+     * {@link Kind#TEXT} 项的合法形状：{@code http(s)://主机[:端口][/路径]}，不接受空白。
+     *
+     * <p>校验的意义在于<b>别把错字存进去</b>：基址会被拼进发出去的链接，一旦写成
+     * {@code rec.example.com}（漏 scheme）或 {@code http://}（没主机），
+     * 群里拿到的就是一条点开必错的链接 —— 而且它是"显式配置"，会绕过"推断不出公网就不发"那道闸。
+     * 所以宁可在这里拒绝、让人重打一遍。
+     *
+     * <p>⚠️ 主机那一段刻意写成"<b>方括号 IPv6 或 不含 {@code / : 空白} 的串</b>"，
+     * 而不是图省事的 {@code [^/\s]+}：后者会把 {@code http://:2233} 整个当主机收下
+     * —— 只有端口没有主机，看着像 URL 其实点不开（这个漏网是探针先试出来的）。
+     */
+    private static final Pattern HTTP_URL =
+            Pattern.compile("(?i)^https?://(\\[[^]]+]|[^\\s/:]+)(:\\d{1,5})?(/\\S*)?$");
+
+    /**
+     * {@link Kind#TEXT} 项的"清空"记号（大小写不敏感）。
+     *
+     * <p>为什么需要它：{@link LoadDSConfig#stringOf} 把<b>空白值当作"没配"</b>，
+     * 所以"写空串"就等于"回到默认（这里=自动推断）"。但没法让用户打一个空字符串 —
+     * 得给个词。{@code -} 也在表里，那是删配置时的顺手习惯。
+     */
+    private static final Set<String> CLEAR_WORDS = Set.of("自动", "auto", "清空", "删除", "-", "none");
+
+    /** 提示里怎么称呼"清空"这件事（用 {@link #CLEAR_WORDS} 里最顺口的那个）。 */
+    private static final String CLEAR_WORD_HINT = "自动";
+
     /** 至少要有其中一个键，否则认为粘贴内容不对，不覆盖已保存的 Cookie */
     private static final String[] REQUIRED_ANY = {"SESSDATA", "buvid3", "buvid4"};
     /** 单条命令的长度上限，防止异常输入 */
@@ -421,28 +451,33 @@ public class BiliConfigPlugins {
     }
 
     /**
-     * 写一项配置。值的合法性按 {@link Kind} 分派校验，<b>校验不过就原样报错、不落库</b>
-     * —— 免得把 config 写成半吊子值（例如给布尔项写个 {@code ture}），
-     * 那种值在 fail-closed 判定下会静默变成"关"，反而比报错难查。
+     * 校验并归一化用户输入。
+     *
+     * <p>⚠️ 用 switch <b>表达式</b>（每支 {@code yield}）而<b>不是</b>语句：语句形式的 switch over enum
+     * 少写一支也编译得过（新加的 {@link Kind} 会静默走进"没校验直接落库"），表达式强制穷尽。
+     * ⚠️ 也正因为是表达式，这里<b>不能写 {@code return}</b>（JLS 禁止在 switch 表达式里 return）——
+     * 校验失败改成 {@code yield null}，由调用方判 null 提前返回。
+     *
+     * @return 要落进 config 的值；<b>{@code null} = 校验不过</b>
+     *         （⚠️ 此时<b>已经回过消息了</b>，调用方直接 return，别重复报错）
      */
-    private void apply(Bot bot, AnyMessageEvent event, Option option, String rawValue) {
-        String value;
-        switch (option.kind) {
+    private String normalize(Bot bot, AnyMessageEvent event, Option option, String rawValue) {
+        return switch (option.kind) {
             case BOOL -> {
                 Boolean bool = parseBool(rawValue);
                 if (bool == null) {
                     send(bot, event, "「" + option.label + "」只认开 / 关"
                             + "（也接受 on/off、true/false、1/0、启用/禁用）。收到：" + rawValue);
-                    return;
+                    yield null;
                 }
-                value = bool.toString();
+                yield bool.toString();
             }
             case INT -> {
                 try {
-                    value = String.valueOf(Integer.parseInt(rawValue.trim()));
+                    yield String.valueOf(Integer.parseInt(rawValue.trim()));
                 } catch (NumberFormatException e) {
                     send(bot, event, "「" + option.label + "」要一个整数（单位小时）。收到：" + rawValue);
-                    return;
+                    yield null;
                 }
             }
             case SOURCE -> {
@@ -453,11 +488,36 @@ public class BiliConfigPlugins {
                     notes.forEach((k, note) -> hint.append("\n  ").append(k).append(" = ").append(note));
                     hint.append("\n收到：").append(rawValue);
                     send(bot, event, hint.toString());
-                    return;
+                    yield null;
                 }
-                value = v;
+                yield v;
             }
-            default -> value = rawValue;
+            case TEXT -> {
+                String v = rawValue.trim();
+                // 清空记号 ⇒ 落空串：stringOf 把空白当"没配"，于是回到该项默认行为（基址=自动推断）
+                if (CLEAR_WORDS.contains(v.toLowerCase())) {
+                    yield "";
+                }
+                if (!HTTP_URL.matcher(v).matches()) {
+                    send(bot, event, "「" + option.label + "」要一个 http/https 地址："
+                            + "https://rec.example.com 或 http://1.2.3.4:2233\n"
+                            + "（发「" + CLEAR_WORD_HINT + "」可清空、回到自动推断）\n收到：" + rawValue);
+                    yield null;
+                }
+                yield v;
+            }
+        };
+    }
+
+    /**
+     * 写一项配置。值的合法性按 {@link Kind} 分派校验，<b>校验不过就原样报错、不落库</b>
+     * —— 免得把 config 写成半吊子值（例如给布尔项写个 {@code ture}），
+     * 那种值在 fail-closed 判定下会静默变成"关"，反而比报错难查。
+     */
+    private void apply(Bot bot, AnyMessageEvent event, Option option, String rawValue) {
+        String value = normalize(bot, event, option, rawValue);
+        if (value == null) {
+            return;                     // 校验不过：normalize 已经回过消息了
         }
 
         try {
@@ -527,11 +587,9 @@ public class BiliConfigPlugins {
     private String currentValue(Option option) {
         String raw = loadDSConfig.getConfigMap().get(option.key);
         if (raw == null || raw.isBlank()) {
-            return switch (option.kind) {
-                case BOOL -> "未配置（按关处理）";
-                case INT -> "未配置（默认 " + CredentialGuard.DEFAULT_CHECK_HOURS + "）";
-                case SOURCE -> "未配置（按 auto 处理）";
-            };
+            // "没配是什么意思"按类型不同，收在 Option#emptyHint 一处 ——
+            // 免得这里一个 switch、别处又写一遍，加类型时漏掉一边
+            return "未配置（" + option.emptyHint() + "）";
         }
         if (option.kind == Kind.BOOL) {
             if (loadDSConfig.isEnabled(option.key)) {
@@ -544,10 +602,14 @@ public class BiliConfigPlugins {
 
     /** 给回复用的短值（布尔项译成中文，其余原样）。 */
     private static String shortValue(Option option, String value) {
-        if (option.kind != Kind.BOOL) {
-            return value;
+        if (option.kind == Kind.BOOL) {
+            return "true".equals(value) ? "开" : "关";
         }
-        return "true".equals(value) ? "开" : "关";
+        if (option.kind == Kind.TEXT && (value == null || value.isBlank())) {
+            // 文本项被清空 ⇒ 落库的是空串，回显时得说清楚这是"回到默认"而不是"没改成"
+            return "(已清空，回到" + option.emptyHint() + ")";
+        }
+        return value;
     }
 
     /**
@@ -593,7 +655,16 @@ public class BiliConfigPlugins {
         /** 整数（如小时数） */
         INT,
         /** 枚举（如 auto/follow/space） */
-        SOURCE
+        SOURCE,
+        /**
+         * 自由文本（如 URL），合法形状由 {@code apply} 按项校验。
+         *
+         * <p>⚠️ 加这个常量<b>必须同步改 {@link #currentValue} 的 {@code switch (kind)}</b>
+         * —— 那是 switch <b>表达式</b>，少一个分支直接编译不过（好事：编译器替我们兜住）。
+         * 而 {@code apply} 里那个是 switch <b>语句</b>，编译器不查穷尽 —— 那边靠 {@link HTTP_URL} 这类
+         * 校验自己兜，别以为加了枚举值就万事大吉。
+         */
+        TEXT
     }
 
     /**
@@ -623,7 +694,19 @@ public class BiliConfigPlugins {
                 "凭据兜底探测间隔（小时）",
                 "≤0 = 关闭兜底（只保留推送失败时的事件驱动探测）；不配则默认 "
                         + CredentialGuard.DEFAULT_CHECK_HOURS,
-                "探测", "间隔", "interval", "hours");
+                "探测", "间隔", "interval", "hours"),
+        // ⚠️ 录播这两项属于「要暴露本机文件 / 要人知道真实拓扑」的那一类，与换 Cookie、换出口同性质
+        // ⇒ 走同一个入口（只认机器人所有者），也正好对应"让所有者配一个公网可达的域名或 IP"。
+        RECORD_WEB("录播网页", Kind.BOOL, LoadDSConfig.KEY_BILI_RECORD_WEB_ENABLED,
+                "把本群订阅的录播做成网页（浏览 / 在线播放 / 下载）",
+                "开：本机磁盘上的录播文件会暴露给浏览器。链接本身就是凭证（等于这个群的共享密码）、"
+                        + "可以被转发；泄了就发「录播网页重置」",
+                "网页", "录播", "web", "record"),
+        RECORD_WEB_BASE("录播网页基址", Kind.TEXT, LoadDSConfig.KEY_BILI_RECORD_WEB_BASE_URL,
+                "「录播网页」发出去的链接用哪个地址开头",
+                "不配则按网卡自动推断；推断出来不是公网地址时不会发链接（只回一段提示让你配这项）"
+                        + " ⇒ 机器人跑在内网/容器里时，这是必配项",
+                "网页基址", "基址", "网址", "baseurl", "weburl");
 
         private final String label;
         private final Kind kind;
@@ -665,7 +748,23 @@ public class BiliConfigPlugins {
             return switch (kind) {
                 case INT -> "12";
                 case SOURCE -> "follow";
+                case TEXT -> "https://rec.example.com";
                 default -> "开";
+            };
+        }
+
+        /**
+         * 该项<b>没配</b>时的实际行为（面板/详情里写在"未配置（…）"括号里）。
+         *
+         * <p>单独一个方法是为了让"每种类型没配是什么样"只有一份 —— 之前这段是内联在
+         * {@code currentValue} 的 switch 里的，加 {@link Kind#TEXT} 时必然要改两处。
+         */
+        String emptyHint() {
+            return switch (kind) {
+                case BOOL -> "按关处理";
+                case INT -> "默认 " + CredentialGuard.DEFAULT_CHECK_HOURS;
+                case SOURCE -> "按 auto 处理";
+                case TEXT -> this == RECORD_WEB_BASE ? "自动推断基址" : "不配该项";
             };
         }
 
@@ -683,6 +782,13 @@ public class BiliConfigPlugins {
                 notes.put("auto", "先试空间流（按 uid 逐个拉），被判风控就自动切关注流 —— 默认值，不用改");
                 notes.put("follow", "始终走关注流：一轮 1 次请求覆盖全部订阅；⚠️ 要求配 Cookie 的账号已关注被订阅的 UP");
                 notes.put("space", "始终按 uid 拉空间动态（出口没被 B 站单独封的环境用这个）");
+            } else if (this == RECORD_WEB_BASE) {
+                // ⚠️ TEXT 项的 notes 只用于**展示**：它的合法性由 HTTP_URL 正则判，
+                // 不像 SOURCE 那样拿 keySet() 当取值集合。所以这里可以放心写示例。
+                notes.put("https://rec.example.com",
+                        "推荐：域名 + 反代。⚠️ 反代必须透传 Range 头，否则进度条和断点续传失效");
+                notes.put("http://1.2.3.4:2233", "公网 IP 直连：端口写 HTTP 服务真实监听的端口");
+                notes.put(CLEAR_WORD_HINT, "清空 ⇒ 回到按网卡自动推断（机器有公网网卡时才推得出来）");
             }
             return notes;
         }

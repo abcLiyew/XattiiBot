@@ -90,6 +90,109 @@ CREATE TABLE IF NOT EXISTS sign_in_records (
   is_delete   INTEGER DEFAULT (0) NOT NULL
 );
 
+-- ============================================================================
+-- 录播（直播录制）
+--
+-- 两张表分工（刻意拆开；设计取舍都写在下面各表的注释里，别再找 docs/直播录制设计.md
+-- —— 那份文档从来没写过，这里曾经指向它，属于死引用）：
+--   live_record_sub  —— 「要自动录制哪些主播」的**配置**。加一行 = 盯上这个房间，
+--                       开播就自动录；一行代表一个主播，长期存在，不随场次增删。
+--   live_record_file —— 每一场录制的**产物**。一个主播录 N 次就有 N 行，
+--                       文件路径/大小/时长/保留标记都在这里。
+-- 拆开的原因：若合成一张表，就得在"配置行"和"产物行"之间反复插占位记录，
+-- 查询和补列都会立刻变脏（一行到底代表主播还是代表一场？）。
+-- ============================================================================
+
+-- 录播订阅表：一行 = 一个要自动录制的主播（长期存在，与"录了几场"无关）
+--
+-- ⚠️ auto_record = 1 才参与开播检测；置 0 = 保留记录但暂停录制（比删掉再建更常用）。
+-- ⚠️ quality 是期望清晰度 qn（10000 = 原画，实测）。留 NULL / ≤0 一律按原画处理。
+--
+-- 🔑 group_id = **这条订阅是谁要的**（QQ 群号）。NULL = 全局订阅（机器人在私聊里加的）。
+--    它决定两件事，都与"录制"无关、只与**可见性**有关：
+--      ① 「录播网页」按群隔离 —— 本群只能看到自己订阅过的房间录出来的东西；
+--      ② 「录播订阅列表」群里只列本群的。
+--    ⚠️ 它**不**决定"录几路"：同一房间被多个群订阅时是**多行**（每群一行），
+--    而录制按 room_id 去重，仍然只录一路（见 LiveRecordServiceImpl#tick）。
+--    所以这一列**不能**加 UNIQUE，也不该在 live_record_file 上冗余一份
+--    （冗余的单值表达不了"两个群都能看同一场"）。
+CREATE TABLE IF NOT EXISTS live_record_sub (
+  sid         INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+  room_id     INTEGER NOT NULL,
+  group_id    INTEGER,
+  uid         INTEGER,
+  uname       TEXT(128),
+  auto_record INTEGER DEFAULT (1) NOT NULL,
+  quality     INTEGER DEFAULT (10000),
+  create_time INTEGER NOT NULL,
+  update_time INTEGER NOT NULL,
+  is_delete   INTEGER DEFAULT (0) NOT NULL
+);
+
+-- 录播网页的访问令牌表：一行 = 一个令牌。
+--
+-- 存在的理由：浏览器里没有 QQ 身份，判定不了"你是不是本群的人"。所以走**群级共享令牌** ——
+-- 由群里的 botadmin 发一次「录播网页」命令拿到链接，转给群成员；链接本身即凭证。
+--
+-- ⚠️ group_id 的两种含义（靠它区分两种令牌，不要再加 kind 列）：
+--     · group_id 有值 —— **群令牌**。只能看这个群订阅过的房间；群成员用它浏览/播放/下载。
+--     · group_id 为空 —— **全局管理码**。可看全部（含全局订阅），并可在网页上改保留 / 删录播。
+--       它**不放链接里**，只由「录播管理码」命令私聊投递给 botadmin（群里回等于贴墙上）。
+--       ⚠️ 单行约定：group_id IS NULL 只允许一行，代码里取/建时用 NULL 匹配同一行。
+--       （这里不能给它加 UNIQUE —— SQLite 的唯一索引不约束 NULL，加了个寂寞。）
+--
+-- ⚠️ token 是 16 字节安全随机数的十六进制（32 字符），**不是**可推导的哈希：
+--    重置 = 直接 UPDATE 成新值，旧链接立刻失效（没有"历史行"要清理）。
+CREATE TABLE IF NOT EXISTS record_web_token (
+  tid         INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+  group_id    INTEGER,
+  token       TEXT(64) NOT NULL,
+  create_time INTEGER NOT NULL,
+  update_time INTEGER NOT NULL,
+  is_delete   INTEGER DEFAULT (0) NOT NULL
+);
+
+-- 录播文件表：一行 = 一场录制（从开播到结束）
+--
+-- ⚠️ status 取值（字符串，不是枚举表）：
+--     RECORDING   正在录（进程内有 worker 在跟；启动时若还看到它 ⇒ 说明上次是异常退出）
+--     DONE        录完了，文件是原始 .flv
+--     COMPRESSED  已被容量巡检压缩过（降分辨率 + H.265），文件是 .mp4，原 .flv 已删
+--     INTERRUPTED 进程重启/异常中断，文件可能不完整（保留着，等人处理或参与淘汰）
+--     FAILED      一次都没录成（0 字节），无文件
+-- ⚠️ keep = 1 表示"不参与自动淘汰"（用户手工标记的珍藏）。⚠️ 压缩也跳过 keep，
+--    理由：压缩会降分辨率、丢画质，对"珍藏"是不可接受的损失。
+-- ⚠️ sid 可空：订阅被取消后，已录好的文件记录还要留着（不然就变成"有文件没记录"，
+--    既统计不到容量、也删不掉）。
+-- ⚠️ size_bytes 是**整个场次目录**的占用（分片合并前的残留也算在内），
+--    容量巡检以它为准做加减；文件被手工删掉时巡检会发现并修正（见 LiveRecordServiceImpl）。
+--
+-- 🔑 **刻意没有 group_id**（虽然查网页时要按群过滤，加一列看起来更省事）：
+--    「这个文件属于哪个群」的真实来源是 **room_id ∈ 该群订阅过的房间**，
+--    而一场直播可能被两个群同时订阅 —— 那样它属于两个群，一列放不下。
+--    所以可见性一律由 live_record_sub 推导（见 LiveRecordSubMapper#selectEverySubscribedRoomIds
+--    与 LiveRecordServiceImpl#roomsOfGroup），这张表只管"录出了什么"。
+CREATE TABLE IF NOT EXISTS live_record_file (
+  fid         INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+  sid         INTEGER,
+  room_id     INTEGER NOT NULL,
+  uid         INTEGER,
+  uname       TEXT(128),
+  title       TEXT(512),
+  path        TEXT(512),
+  size_bytes  INTEGER DEFAULT (0) NOT NULL,
+  duration_ms INTEGER DEFAULT (0) NOT NULL,
+  quality     INTEGER DEFAULT (0),
+  start_time  INTEGER NOT NULL,
+  end_time    INTEGER DEFAULT (0) NOT NULL,
+  status      TEXT(24) DEFAULT 'RECORDING' NOT NULL,
+  keep        INTEGER DEFAULT (0) NOT NULL,
+  compressed  INTEGER DEFAULT (0) NOT NULL,
+  create_time INTEGER NOT NULL,
+  update_time INTEGER NOT NULL,
+  is_delete   INTEGER DEFAULT (0) NOT NULL
+);
+
 -- 注：sqlite_sequence 由 SQLite 自动维护（只要用了 AUTOINCREMENT），不需要也不应该手工创建。
 
 
@@ -135,3 +238,47 @@ CREATE INDEX IF NOT EXISTS idx_push_info_room_qq_uid_group
 
 CREATE INDEX IF NOT EXISTS idx_sign_in_records_qq_uid_group
     ON sign_in_records (qq_uid, group_id);
+
+--   idx_live_record_sub_room_id
+--       服务 LiveRecordServiceImpl 的「这个房间要不要录 / 订阅在不在」（恒为 room_id = ?）。
+--       ⚠️ 开播检测 tick 走的是 selectList(全表)，索引救不了那一条 —— 它本来就要读全部订阅行；
+--       索引只让"加/删订阅、按房间查订阅"这类点查受益。
+--
+--   idx_live_record_file_room_status
+--       服务「这个房间当前有没有在录的行」（room_id = ? AND status = ?）。
+--
+--   idx_live_record_file_start_time
+--       服务容量巡检的**淘汰排序**（按 start_time 升序取最早的）。
+--       这是全表排序里唯一能吃到索引的一条，且它正是"删最旧的"那条热路径。
+--
+-- 都是普通（非唯一）索引：同一个房间显然会有多行、同一时刻允许多场历史记录。
+CREATE INDEX IF NOT EXISTS idx_live_record_sub_room_id
+    ON live_record_sub (room_id);
+
+--   idx_live_record_sub_group_room
+--       服务「录播网页」的可见性推导：给定群号，取出它订阅过的全部房间号
+--       （LiveRecordSubMapper#selectEverySubscribedRoomIds，条件是 group_id = ?）。
+--       列顺序 group_id 在前 —— 等值条件打头，room_id 只用来覆盖索引本身。
+--
+--   idx_record_web_token_token  —— 唯一索引
+--       服务「网页请求 → 这是哪个群」，条件是 token = ?，每次请求都走。
+--       它必须**唯一**：查表是按 token 反查群号，两行同 token 就等于两个群串号。
+--       （SQLite 里 NULL 不参与唯一约束，所以多个 group_id 为空的行走不了这条；
+--        但代码只取/建一行，见建表处 group_id 的说明。）
+--
+--   idx_record_web_token_group_id
+--       服务「这个群的令牌还在不在」（group_id = ?），只在取/重置令牌时走一次。
+CREATE INDEX IF NOT EXISTS idx_live_record_sub_group_room
+    ON live_record_sub (group_id, room_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_record_web_token_token
+    ON record_web_token (token);
+
+CREATE INDEX IF NOT EXISTS idx_record_web_token_group_id
+    ON record_web_token (group_id);
+
+CREATE INDEX IF NOT EXISTS idx_live_record_file_room_status
+    ON live_record_file (room_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_live_record_file_start_time
+    ON live_record_file (start_time);

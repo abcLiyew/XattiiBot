@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow, noarchive">
+<title>录播预览</title>
+<style>
+  :root{
+    --bg:#f5f6f8; --card:#ffffff; --line:#e5e7eb; --text:#1f2329; --muted:#8a8f99;
+    --accent:#2f6fed; --accent-soft:#eaf1ff; --ok:#0f9d58; --warn:#c77700; --bad:#d13b3b;
+    --radius:12px;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font:15px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei","Helvetica Neue",Arial,sans-serif;
+  }
+  .wrap{max-width:880px; margin:0 auto; padding:16px 14px 64px}
+  header.top{display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:14px}
+  h1{font-size:18px; margin:0; font-weight:600; letter-spacing:.3px}
+  .stat{color:var(--muted); font-size:13px}
+  .spacer{flex:1}
+  button{
+    font:inherit; border:1px solid var(--line); background:var(--card); color:var(--text);
+    border-radius:9px; padding:7px 12px; cursor:pointer; transition:.15s;
+  }
+  button:hover{border-color:#cfd4dc; background:#fbfbfc}
+  button.primary{background:var(--accent); border-color:var(--accent); color:#fff}
+  button.primary:hover{background:#2a63d6}
+  button.danger{color:var(--bad); border-color:#f0c6c6}
+  button.danger:hover{background:#fff5f5}
+  button:disabled{opacity:.5; cursor:not-allowed}
+  .panel{background:var(--card); border:1px solid var(--line); border-radius:var(--radius); padding:14px; margin-bottom:14px}
+  .hintbar{background:var(--accent-soft); border:1px solid #d5e2ff; color:#1c4bb8;
+    border-radius:10px; padding:10px 12px; font-size:13.5px; margin-bottom:14px; display:none; white-space:pre-wrap}
+  .hintbar.err{background:#fff2f2; border-color:#f3cccc; color:#a12020}
+  .card{background:var(--card); border:1px solid var(--line); border-radius:var(--radius);
+    padding:13px 14px; margin-bottom:10px}
+  .row1{display:flex; align-items:baseline; gap:8px; flex-wrap:wrap}
+  .who{font-weight:600}
+  .fid{color:var(--muted); font-size:12.5px; font-variant-numeric:tabular-nums}
+  .title{color:var(--muted); font-size:13px; margin-top:2px; word-break:break-all}
+  .meta{color:var(--muted); font-size:12.5px; margin-top:6px; display:flex; gap:12px; flex-wrap:wrap;
+    font-variant-numeric:tabular-nums}
+  .badges{display:flex; gap:6px; flex-wrap:wrap; margin-top:8px}
+  .badge{font-size:11.5px; padding:2px 8px; border-radius:999px; border:1px solid var(--line); color:var(--muted)}
+  .badge.keep{color:var(--warn); border-color:#f0dcb4; background:#fffaf0}
+  .badge.live{color:var(--bad); border-color:#f3cccc; background:#fff5f5}
+  .badge.ok{color:var(--ok); border-color:#c3e6d4; background:#f2fbf6}
+  .badge.bad{color:var(--bad); border-color:#f3cccc; background:#fff5f5}
+  .acts{display:flex; gap:8px; flex-wrap:wrap; margin-top:11px}
+  .acts button{padding:6px 11px; font-size:13.5px}
+  video{width:100%; margin-top:11px; border-radius:10px; background:#000; display:none}
+  .pager{display:flex; align-items:center; justify-content:center; gap:12px; margin-top:16px; color:var(--muted)}
+  .empty{text-align:center; color:var(--muted); padding:42px 12px; line-height:1.9}
+  .managebox{display:none; margin-top:10px}
+  .managebox input{
+    font:inherit; width:100%; padding:8px 10px; border:1px solid var(--line);
+    border-radius:9px; background:#fbfbfc; color:var(--text)
+  }
+  .managebox .tip{font-size:12.5px; color:var(--muted); margin-top:6px}
+  .foot{color:var(--muted); font-size:12px; text-align:center; margin-top:26px}
+  code{background:#f0f1f3; padding:1px 5px; border-radius:5px; font-size:12.5px}
+  @media (max-width:480px){
+    .acts button{flex:1 1 auto}
+    h1{font-size:16.5px}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top">
+    <h1 id="heading">录播预览</h1>
+    <span class="stat" id="stat"></span>
+    <span class="spacer"></span>
+    <button id="btnCopy" title="把这一页的链接复制下来，方便转给群成员">复制链接</button>
+    <button id="btnManage" title="输入管理码后可改保留标记、删除录播">管理</button>
+  </header>
+
+  <div class="panel managebox" id="manageBox">
+    <label for="manageInput"></label><input id="manageInput" type="password" placeholder="粘贴管理码（在 QQ 里发「录播管理码」私聊获取）" autocomplete="off">
+    <div class="tip">
+      管理码是给 <b>botadmin</b> 用的，能改保留标记和删除录播，<b>不要发到群里</b>。
+      留空保存 = 退出管理模式。
+    </div>
+  </div>
+
+  <div class="hintbar" id="hint"></div>
+  <div id="list"></div>
+
+  <div class="pager" id="pager" style="display:none">
+    <button id="prev">上一页</button>
+    <span id="pageInfo"></span>
+    <button id="next">下一页</button>
+  </div>
+
+  <div class="empty" id="empty" style="display:none"></div>
+
+  <div class="foot">
+    录播文件保存在机器人所在服务器上；这里只做预览，管理动作（订阅、保留、删除）也可在群里用命令完成。
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  // 路径形如 /record/<token>。令牌由服务端生成，这里只负责原样带回去。
+  var segs = location.pathname.split('/').filter(Boolean);
+  var TOKEN = segs.length >= 2 ? decodeURIComponent(segs[1]) : '';
+  var API = '/record/api/' + encodeURIComponent(TOKEN);
+  var MANAGE_KEY = 'xatibot.record.manage';
+
+  var page = 1;
+  var current = null;
+  var player = null;
+
+  var $ = function (id) { return document.getElementById(id); };
+
+  /* ---------------- 管理码（只存本机，不上传） ---------------- */
+  function manageToken() {
+    try { return localStorage.getItem(MANAGE_KEY) || ''; } catch (e) { return ''; }
+  }
+  function setManageToken(v) {
+    try { v ? localStorage.setItem(MANAGE_KEY, v) : localStorage.removeItem(MANAGE_KEY); } catch (e) {}
+  }
+  function canManage() {
+    return (current && current.admin) || manageToken().length > 0;
+  }
+
+  /* ---------------- 小工具 ---------------- */
+  function esc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+  function fmtBytes(n) {
+    n = Number(n) || 0;
+    if (n <= 0) return '0B';
+    var u = ['B', 'KB', 'MB', 'GB', 'TB'], i = 0;
+    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return (i === 0 ? n : n.toFixed(n < 10 ? 1 : 0)) + u[i];
+  }
+  function fmtDuration(ms) {
+    ms = Number(ms) || 0;
+    if (ms <= 0) return '时长未知';
+    var s = Math.round(ms / 1000), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+    s = s % 60;
+    var pad = function (x) { return x < 10 ? '0' + x : '' + x; };
+    return h > 0 ? h + ':' + pad(m) + ':' + pad(s) : m + ':' + pad(s);
+  }
+  function fmtTime(ms) {
+    ms = Number(ms) || 0;
+    if (ms <= 0) return '时间未知';
+    var d = new Date(ms);
+    var pad = function (x) { return x < 10 ? '0' + x : '' + x; };
+    return (d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+  }
+  function hint(text, isError) {
+    var el = $('hint');
+    if (!text) { el.style.display = 'none'; el.textContent = ''; return; }
+    el.textContent = text;
+    el.className = 'hintbar' + (isError ? ' err' : '');
+    el.style.display = 'block';
+  }
+
+  /* ---------------- 列表 ---------------- */
+  function badges(it) {
+    var out = [];
+    var st = String(it.status || '').toUpperCase();
+    if (it.keep) out.push('<span class="badge keep">🔒 保留</span>');
+    if (st === 'RECORDING') out.push('<span class="badge live">● 录制中</span>');
+    else if (st === 'FAILED') out.push('<span class="badge bad">✕ 没录到</span>');
+    else if (st === 'INTERRUPTED') out.push('<span class="badge">⚠ 中断（可能不完整）</span>');
+    else if (it.compressed) out.push('<span class="badge ok">已压缩 H.265</span>');
+    else out.push('<span class="badge ok">可播放</span>');
+    if (it.missingFile) out.push('<span class="badge bad">文件已不在磁盘上</span>');
+    return out.join('');
+  }
+
+  function cardHtml(it) {
+    var h = [];
+    h.push('<div class="card" data-fid="' + it.fid + '">');
+    h.push('<div class="row1"><span class="who">' + esc(it.uname) + '</span>');
+    h.push('<span class="fid">#' + it.fid + ' · 房间 ' + esc(it.roomId) + '</span></div>');
+    if (it.title) h.push('<div class="title">' + esc(it.title) + '</div>');
+    h.push('<div class="meta"><span>' + fmtTime(it.startTime) + '</span>');
+    h.push('<span>时长 ' + fmtDuration(it.durationMs) + '</span>');
+    h.push('<span>' + fmtBytes(it.sizeBytes) + '</span></div>');
+    h.push('<div class="badges">' + badges(it) + '</div>');
+    h.push('<div class="acts">');
+    if (it.playable) {
+      h.push('<button class="primary" data-act="play">▶ 播放</button>');
+      h.push('<button data-act="download">下载</button>');
+    }
+    if (canManage() && String(it.status).toUpperCase() !== 'RECORDING') {
+      h.push('<button data-act="keep">' + (it.keep ? '取消保留' : '标记保留') + '</button>');
+      h.push('<button class="danger" data-act="delete">删除</button>');
+    }
+    h.push('</div>');
+    h.push('<video controls preload="none" playsinline></video>');
+    h.push('</div>');
+    return h.join('');
+  }
+
+  function render() {
+    var d = current;
+    if (!d) return;
+
+    $('heading').textContent = d.view === 'admin' ? '录播预览（全部）' : '录播预览（本群）';
+    $('stat').textContent = '共 ' + d.total + ' 场 · ' + fmtBytes(d.usedBytes);
+    $('btnManage').style.display = d.admin ? 'none' : '';
+
+    // 管理按钮的文字随状态变，让人一眼看出现在是"管理模式"还是普通模式
+    if (!d.admin) {
+      $('btnManage').textContent = manageToken() ? '管理模式（已启用）' : '管理';
+      $('btnManage').className = manageToken() ? 'primary' : '';
+    }
+
+    var list = $('list');
+    if (!d.items.length) {
+      list.innerHTML = '';
+      var e = $('empty');
+      e.style.display = 'block';
+      if (d.admin) {
+        e.innerHTML = '还没有录到任何东西。<br>先在群里用 <code>录播订阅 房间号</code> 加上要看的主播。';
+      } else {
+        e.innerHTML = esc(d.hint || '这个群还没有可看的录播。').replace(/\n/g, '<br>');
+      }
+    } else {
+      $('empty').style.display = 'none';
+      list.innerHTML = d.items.map(cardHtml).join('');
+      list.querySelectorAll('.card').forEach(function (card) {
+        var fid = Number(card.getAttribute('data-fid'));
+        card.querySelectorAll('button[data-act]').forEach(function (btn) {
+          btn.addEventListener('click', function () {
+            onAct(btn.getAttribute('data-act'), fid, card, btn);
+          });
+        });
+      });
+    }
+
+    if (d.pages > 1) {
+      $('pager').style.display = 'flex';
+      $('pageInfo').textContent = d.page + ' / ' + d.pages;
+      $('prev').disabled = d.page <= 1;
+      $('next').disabled = d.page >= d.pages;
+    } else {
+      $('pager').style.display = 'none';
+    }
+  }
+
+  function load(p) {
+    hint('');
+    fetch(API + '/files?page=' + (p || 1), { credentials: 'omit' })
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function (d) { current = d; page = d.page; stopPlayer(); render(); })
+      .catch(function (e) { hint('加载失败：' + e.message + '（链接可能已失效）', true); });
+  }
+
+  function stopPlayer() {
+    if (player) { try { player.pause(); } catch (e) {} player = null; }
+  }
+
+  /* ---------------- 动作 ---------------- */
+  function onAct(act, fid, card, btn) {
+    if (act === 'play') return doPlay(fid, card, btn);
+    if (act === 'download') {
+      location.href = API + '/download/' + fid;
+      return;
+    }
+    if (act === 'keep') return doKeep(fid, btn);
+    if (act === 'delete') return doDelete(fid);
+  }
+
+  function doPlay(fid, card, btn) {
+    var video = card.querySelector('video');
+    stopPlayer();
+    btn.disabled = true;
+    btn.textContent = '准备中…';
+    hint('正在准备播放。第一次播一场要先把它转成浏览器能放的 mp4（只是换壳，几秒到十几秒）…');
+    fetch(API + '/prepare/' + fid, { credentials: 'omit' })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (!j.ok) { hint('打不开：' + (j.error || '未知原因'), true); return; }
+        hint('');
+        video.style.display = 'block';
+        video.src = API + '/play/' + fid;
+        player = video;
+        var go = video.play();
+        if (go && go.catch) {
+          go.catch(function () { hint('浏览器拦下了自动播放，点一下播放器上的三角即可。'); });
+        }
+      })
+      .catch(function (e) { hint('准备失败：' + e.message, true); })
+      .finally(function () {
+        btn.disabled = false;
+        btn.textContent = '▶ 播放';
+      });
+  }
+
+  function manage(path, cb) {
+    fetch(API + path, {
+      method: 'POST',
+      credentials: 'omit',
+      headers: { 'X-Record-Manage': manageToken() }
+    }).then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+      .then(function (res) {
+        if (!res.ok || !res.body.ok) {
+          hint('操作失败：' + ((res.body && res.body.error) || '未知原因'), true);
+          return;
+        }
+        hint(res.body.message || '已处理');
+        cb();
+      })
+      .catch(function (e) { hint('操作失败：' + e.message, true); });
+  }
+
+  function doKeep(fid, btn) {
+    var it = (current.items || []).filter(function (x) { return x.fid === fid; })[0];
+    var next = it && it.keep ? 0 : 1;
+    btn.disabled = true;
+    manage('/keep/' + fid + '?keep=' + next, function () { load(page); });
+  }
+
+  function doDelete(fid) {
+    if (!confirm('确定删除 #' + fid + ' 吗？文件会一起从服务器上清掉，无法恢复。')) return;
+    manage('/delete/' + fid, function () {
+      // 删的是本页最后一项时回退一页，免得停在一个空页上
+      var remain = (current.items || []).length - 1;
+      load(remain <= 0 && page > 1 ? page - 1 : page);
+    });
+  }
+
+  /* ---------------- 事件绑定 ---------------- */
+  $('prev').addEventListener('click', function () { if (page > 1) load(page - 1); });
+  $('next').addEventListener('click', function () { load(page + 1); });
+
+  $('btnManage').addEventListener('click', function () {
+    var box = $('manageBox');
+    box.style.display = box.style.display === 'block' ? 'none' : 'block';
+    if (box.style.display === 'block') {
+      $('manageInput').value = manageToken();
+      $('manageInput').focus();
+    }
+  });
+  $('manageInput').addEventListener('change', function () {
+    setManageToken(this.value.trim());
+    $('manageBox').style.display = 'none';
+    hint(this.value.trim() ? '已保存管理码（只存在这台设备上），现在可以改保留和删除了。' : '已退出管理模式。');
+    load(page);
+  });
+
+  $('btnCopy').addEventListener('click', function () {
+    var url = location.href;
+    var done = function () {
+      var b = $('btnCopy');
+      b.textContent = '已复制';
+      setTimeout(function () { b.textContent = '复制链接'; }, 1500);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(url).then(done, function () { fallbackCopy(url, done); });
+    } else {
+      fallbackCopy(url, done);
+    }
+  });
+
+  function fallbackCopy(text, done) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); done(); } catch (e) { hint('复制失败，请手动复制地址栏。', true); }
+    document.body.removeChild(ta);
+  }
+
+  load(1);
+})();
+</script>
+</body>
+</html>

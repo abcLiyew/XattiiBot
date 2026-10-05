@@ -185,6 +185,263 @@ public class LoadDSConfig {
      */
     public static final String KEY_BILI_DOWNLOAD_FFMPEG_URL = "biliDownloadFfmpegUrl";
 
+    // ------------------------------------------------------------------ 录播（直播录制）
+
+    // 录播各项的默认值集中放这里（配置键缺失时用）。
+    // 放在 key 旁边而不是散在消费方：这些数决定"会不会把盘写满"，改的时候应该一眼看全。
+    /** 默认录播目录（相对进程工作目录） */
+    public static final String DEFAULT_RECORD_DIR = "record";
+    /** 默认开播检测间隔（秒） */
+    public static final int DEFAULT_RECORD_CHECK_SECONDS = 30;
+    /** 默认单场录制时长上限（秒）= 6 小时 */
+    public static final int DEFAULT_RECORD_MAX_SECONDS = 21600;
+    /** 默认并发录制上限 */
+    public static final int DEFAULT_RECORD_MAX_CONCURRENT = 2;
+    /** 默认磁盘水位下限（MB）= 2 GB */
+    public static final int DEFAULT_RECORD_DISK_MIN_FREE_MB = 2048;
+    /** 默认压缩水位（MB）= 15 GB */
+    public static final int DEFAULT_RECORD_COMPRESS_TOTAL_MB = 15360;
+    /** 默认硬水位（MB）= 25 GB */
+    public static final int DEFAULT_RECORD_HARD_TOTAL_MB = 25600;
+    /** 默认压缩目标最大高度（像素） */
+    public static final int DEFAULT_RECORD_COMPRESS_HEIGHT = 720;
+    /** 默认 H.265 CRF */
+    public static final int DEFAULT_RECORD_COMPRESS_CRF = 28;
+    /** 默认 x265 preset */
+    public static final String DEFAULT_RECORD_COMPRESS_PRESET = "fast";
+    /** 默认录制清晰度 qn（原画） */
+    public static final int DEFAULT_RECORD_QUALITY = 10000;
+    /** 默认交付模式：auto（能推断出 NapCat 可达基址就走 URL，否则本地路径） */
+    public static final String DEFAULT_RECORD_DELIVERY_MODE = "auto";
+    /** 默认录播文件服务监听端口 */
+    public static final int DEFAULT_RECORD_SERVE_PORT = 2335;
+    /** 默认监听地址（0.0.0.0 = 所有网卡；可收紧到 docker 网桥地址） */
+    public static final String DEFAULT_RECORD_SERVE_BIND = "0.0.0.0";
+    /** 默认下载链接有效期（分钟） */
+    public static final int DEFAULT_RECORD_LINK_TTL_MINUTES = 15;
+    /** 默认下载链接可用次数 */
+    public static final int DEFAULT_RECORD_LINK_MAX_USES = 5;
+    /** 默认 base64 交付的体积上限（MB） */
+    public static final int DEFAULT_RECORD_BASE64_MAX_MB = 24;
+
+    /**
+     * 配置键：<b>录播总闸</b>。取值 {@code true/1/on/yes} 才开，<b>默认关</b>。
+     *
+     * <p><b>为什么默认关</b>：录播是**唯一会持续占用磁盘和带宽**的功能 ——
+     * 一台主播开播就多一个 ffmpeg 进程 + 一条持续写入的文件，
+     * 而这个项目跑在一台 4 核、几十 G 盘的机器上。默认关掉，
+     * 想让谁录谁自己开，这与 P2-5/P2-6/P2-7 那批"默认不改变行为"的开关是同一条纪律。
+     *
+     * <p>关了之后：开播检测任务直接返回，<b>一个 B 站请求都不发</b>，
+     * 手动录制命令回一句"录播未启用"。
+     */
+    public static final String KEY_BILI_RECORD_ENABLED = "biliRecordEnabled";
+
+    /**
+     * 配置键：录播目录，**相对进程工作目录**（与 {@code ./resources/}、{@code ./bin/} 同一口径）。
+     * 默认 {@code record}。
+     *
+     * <p>目录结构：{@code <录播目录>/<roomId>/<fid>/}，每场录制一个子目录
+     * （见 {@code LiveRecordFile} 的类注释："删记录 = 删目录"，不会留下孤儿文件）。
+     */
+    public static final String KEY_BILI_RECORD_DIR = "biliRecordDir";
+
+    /**
+     * 配置键：<b>开播检测间隔（秒）</b>，默认 {@code 30}。
+     *
+     * <p>这个值 = "主播开播到开始录制"的最大延迟。之所以敢 30 秒：
+     * 它打的是直播间信息端点（{@code live.bilibili.com}），不是被风控盯着的动态域；
+     * 且只在<b>录播订阅</b>的房间上打，量级 = 订阅数 / 30 秒。
+     *
+     * <p>⚠️ 调小它不会让录制更"完整"—— 直播流是持续的，晚 30 秒开始只是少录开头 30 秒，
+     * 而请求量是按比例涨的。别为了"抢开头"把它调到几秒。
+     */
+    public static final String KEY_BILI_RECORD_CHECK_SECONDS = "biliRecordCheckSeconds";
+
+    /**
+     * 配置键：<b>单场录制时长上限（秒）</b>，默认 {@code 21600}（6 小时）。
+     *
+     * <p><b>它是兜底，不是常规停止条件</b> —— 常规停止是"主播下播"（流断 + 状态翻转）。
+     * 这道上限治的是：下播检测因为某种原因没生效时，别让一个进程把盘写满。
+     *
+     * <p>⚠️ 到达上限会**按正常收工处理**（合并、登记），不是"失败"。
+     */
+    public static final String KEY_BILI_RECORD_MAX_SECONDS = "biliRecordMaxSeconds";
+
+    /**
+     * 配置键：<b>并发录制上限</b>，默认 {@code 2}。
+     *
+     * <p>同时录 N 路 = N 个 ffmpeg 进程 + N 倍带宽。录制的 ffmpeg 用的是 {@code -c copy}
+     * （不转码，CPU 近似为 0），所以瓶颈在带宽与磁盘、不在 CPU；
+     * 2 路是"同时开播两个主播"这种常见情形的默认值。
+     */
+    public static final String KEY_BILI_RECORD_MAX_CONCURRENT = "biliRecordMaxConcurrent";
+
+    /**
+     * 配置键：<b>磁盘水位下限（MB）</b>，默认 {@code 2048}。
+     *
+     * <p>低于它就拒绝开始新的录制（已经在录的不动）。这条是**录音写入前的最后一道闸**：
+     * 容量巡检是按"已登记的文件"算的，而正在录的那一路还没登记，
+     * 只靠巡检拦不住"一边录一边把盘写满"。
+     */
+    public static final String KEY_BILI_RECORD_DISK_MIN_FREE_MB = "biliRecordDiskMinFreeMb";
+
+    /**
+     * 配置键：<b>压缩水位（MB）</b>，默认 {@code 15360}（15 GB）。{@code ≤0} = 关闭压缩。
+     *
+     * <p>录播总占用超过它就<b>开始压缩最旧的、还没压缩过的</b>（保留标记的除外），
+     * 压到水位以下为止。/ {@code LiveRecordServiceImpl#maintain()} 是唯一读它的地方。
+     *
+     * <p>⚠️ <b>压缩是纯 CPU 的 H.265 重编码，很慢</b>（这台机器 4 核、无硬件编码器，
+     * 15 GB 可能要数小时），所以它是**串行后台任务**、不会影响录制与推送；
+     * 但也正因为它慢，<b>水位之差（25GB - 15GB = 10GB）就是留给它的缓冲</b>。
+     * 把两个值调得很接近，会出现"还没压完就到删除线"的抖动。
+     */
+    public static final String KEY_BILI_RECORD_COMPRESS_TOTAL_MB = "biliRecordCompressTotalMb";
+
+    /**
+     * 配置键：<b>硬水位（MB）</b>，默认 {@code 25600}（25 GB）。{@code ≤0} = 不自动删除。
+     *
+     * <p>录播总占用超过它就<b>从最早的开始删除</b>，
+     * <b>跳过 {@code keep=1} 的</b>（"标记为不删除的除外"），删到水位以下为止。
+     *
+     * <p>⚠️ 如果**所有**可删的都被标记了保留，它会停下来并打告警、<b>不会硬删</b> ——
+     * 这时候该做的是人工处理，而不是让机器人替用户决定"哪个珍藏可以扔"。
+     */
+    public static final String KEY_BILI_RECORD_HARD_TOTAL_MB = "biliRecordHardTotalMb";
+
+    /**
+     * 配置键：压缩后的<b>目标最大高度</b>（像素），默认 {@code 720}；{@code ≤0} = 不改分辨率。
+     *
+     * <p>与 CRF 一起决定压缩比。源是 1080p 时降到 720p 通常能再省三成，配合 H.265 整体减半左右。
+     * 宽度按比例自适应（{@code scale=-2:h}），不会被拉变形。
+     */
+    public static final String KEY_BILI_RECORD_COMPRESS_HEIGHT = "biliRecordCompressHeight";
+
+    /**
+     * 配置键：H.265 的 <b>CRF</b>（恒定质量因子），默认 {@code 28}。
+     *
+     * <p>数值越大越糊、越小越清晰也越大。x265 的 28 大致相当于 x264 的 23（默认值），
+     * 在录播这种"能看清就行"的场景是合适的；要更清晰就往 24 调。
+     */
+    public static final String KEY_BILI_RECORD_COMPRESS_CRF = "biliRecordCompressCrf";
+
+    /**
+     * 配置键：x265 的 <b>preset</b>，默认 {@code fast}。
+     *
+     * <p>⚠️ 这是"画质/体积"与"耗时"的旋钮，在 4 核机器上差别是**数倍**：
+     * {@code medium} 比 {@code fast} 慢一倍多、只省几个百分点。默认 {@code fast} 是
+     * 按这台机器的实际能力选的；想省时间可以降到 {@code veryfast}。
+     */
+    public static final String KEY_BILI_RECORD_COMPRESS_PRESET = "biliRecordCompressPreset";
+
+    /**
+     * 配置键：录制时请求的<b>清晰度 qn</b>，默认 {@code 10000}（原画）。
+     *
+     * <p>⚠️ 服务端可能静默降级（实测"要原画给高清"），实际拿到什么以录制时读到的
+     * {@code current_qn} 为准，会记在录播文件行上、并在列表里如实展示。
+     */
+    public static final String KEY_BILI_RECORD_QUALITY = "biliRecordQuality";
+
+    /**
+     * 配置键：<b>NapCat 能从哪个基址下载录播</b>，形如 {@code http://172.17.0.1:2335}。
+     *
+     * <p>🔴 <b>这是"NapCat 和机器人不在一台机器上"时唯一可靠的开关</b>。
+     * OneBot 的 {@code upload_group_file} 里那个 file 是<b>NapCat 自己去打开</b>的，
+     * 所以本地路径在"NapCat 跑在 Docker 里"时必然失败 —— <b>线上就是这种情况</b>
+     * （2026-10-04 实测：napcat 容器在默认 bridge 上，宿主机 docker0 = {@code 172.17.0.1}）。
+     *
+     * <p>留空 = 自动推断（优先 docker 网桥地址 → 出口网卡地址 → 回环）。
+     * <b>推断结果会打进启动日志</b>，拿不准就直接看日志，或配死这个键。
+     */
+    public static final String KEY_BILI_RECORD_PUBLIC_BASE_URL = "biliRecordPublicBaseUrl";
+
+    /**
+     * 配置键：录播交付方式，取值 {@code auto}（默认）/ {@code local} / {@code url} / {@code base64}。
+     *
+     * <ul>
+     *   <li>{@code auto}：能推断出可达基址走 {@code url}，否则退回 {@code local}；</li>
+     *   <li>{@code local}：把本地路径直接交给 NapCat —— <b>仅当它与机器人共享文件系统时可用</b>；</li>
+     *   <li>{@code url}：内置文件服务出 URL，NapCat 自己去下（跨容器/跨机时用这个）；</li>
+     *   <li>{@code base64}：把文件内容内联在指令里 —— <b>零网络依赖</b>，代价是体积，
+     *       超过 {@link #KEY_BILI_RECORD_BASE64_MAX_MB} 会被拒绝。</li>
+     * </ul>
+     *
+     * <p>⚠️ {@code auto} 在两种拓扑下都能给出正确结果，<b>除非</b>NapCat 在另一台机器上
+     * 且自动推断错了（那时会表现为"上传失败"）—— 这时显式配 {@link #KEY_BILI_RECORD_PUBLIC_BASE_URL}。
+     */
+    public static final String KEY_BILI_RECORD_DELIVERY_MODE = "biliRecordDeliveryMode";
+
+    /**
+     * 配置键：内置录播文件服务的<b>监听端口</b>，默认 {@code 2335}。
+     *
+     * <p>被占用时会自动退到随机端口（只是下载链接里的端口变了，功能不受影响）——
+     * 但容器端口映射/防火墙是按固定端口配的，所以那种情况下建议把它改成一个空闲端口。
+     */
+    public static final String KEY_BILI_RECORD_SERVE_PORT = "biliRecordServePort";
+
+    /**
+     * 配置键：内置录播文件服务的<b>监听地址</b>，默认 {@code 0.0.0.0}。
+     *
+     * <p>⚠️ {@code 0.0.0.0} = 所有网卡，包括公网那一个。下载链接本身有随机 token + 时效 + 次数上限，
+     * 但如果这台机器有公网 IP，建议收紧成 NapCat 真正需要的那张网卡
+     * （例如容器场景下的 {@code 172.17.0.1}），或直接在防火墙上只放给容器网段。
+     */
+    public static final String KEY_BILI_RECORD_SERVE_BIND = "biliRecordServeBind";
+
+    /**
+     * 配置键：下载链接<b>有效期（分钟）</b>，默认 {@code 15}。过期的链接 410。
+     *
+     * <p>"发出去就不管"的下载链接等于永久公开，所以有它。
+     */
+    public static final String KEY_BILI_RECORD_LINK_TTL_MINUTES = "biliRecordLinkTtlMinutes";
+
+    /**
+     * 配置键：下载链接<b>可用次数</b>，默认 {@code 5}。
+     *
+     * <p>给几次余量是为了容忍断点重试（客户端可能重复发请求），但不能无限。
+     */
+    public static final String KEY_BILI_RECORD_LINK_MAX_USES = "biliRecordLinkMaxUses";
+
+    /**
+     * 配置键：{@code base64} 交付模式的体积上限（MB），默认 {@code 24}。
+     *
+     * <p>base64 会把文件放大 1/3 并<b>整个读进内存</b>，还要再塞进一条 WS 消息里
+     * （两端各一份）⇒ 大文件用它只会把两个进程一起搞崩。超过就明确拒绝并提示改用 url 模式。
+     */
+    public static final String KEY_BILI_RECORD_BASE64_MAX_MB = "biliRecordBase64MaxMb";
+
+    /**
+     * 配置键：<b>录播网页</b>总闸。取值 {@code true/1/on/yes} 才开，<b>默认关</b>。
+     *
+     * <p><b>它开的是什么</b>：一个网页（挂在 HTTP 服务上，默认 2233 端口），
+     * 群成员用群里的链接打开就能<b>浏览 / 在线播放 / 下载</b>本群订阅的录播。
+     * 群里 botadmin 及以上发「录播网页」拿到链接，转发给群成员即可。
+     *
+     * <p><b>为什么默认关</b>：这条功能与其它所有开关都不同 —— 它把本机磁盘上的文件
+     * <b>暴露给浏览器</b>。虽然用的是群级随机令牌（可重置），但"要不要在网上开一个口子"
+     * 该由人显式决定，不该是装完就有的默认状态。
+     *
+     * <p>关了之后：{@code /record/**} 一律 404（<b>不是</b> 403 —— 那等于告诉外面
+     * "这里有个功能，只是你没权限"），「录播网页」命令回一句"未启用"。
+     */
+    public static final String KEY_BILI_RECORD_WEB_ENABLED = "biliRecordWebEnabled";
+
+    /**
+     * 配置键：录播网页的<b>对外基址</b>，形如 {@code http://example.com} 或
+     * {@code http://1.2.3.4:2233}（可以带反代路径前缀）。
+     *
+     * <p>留空 = 自动推断：取"去往 NapCat 的出口网卡地址"（已排除 docker 网桥）+ 监听端口。
+     * 推断结果会打进启动日志与「录播网页」命令的回显里。
+     *
+     * <p>🔴 <b>什么时候必须显式配</b>：机器有公网 IP 但走域名/反代、
+     * 或者 HTTP 服务只在容器/内网可达而群成员要从外面打开 —— 这时自动推断出的是
+     * <b>内网地址</b>，链接发给群成员会打不开。判断方法很直接：
+     * 命令回的链接<b>你自己在手机上点一下</b>能不能打开。
+     */
+    public static final String KEY_BILI_RECORD_WEB_BASE_URL = "biliRecordWebBaseUrl";
+
+
     @Value(value = "${bot.qq}")
     Long botQQ;
     @Value(value = "${bot.admin}")
@@ -403,6 +660,49 @@ public class LoadDSConfig {
     }
 
     /**
+     * 读一个<b>整数配置</b>，缺失 / 空白 / 解析不出来时返回 {@code defaultValue}。
+     *
+     * <p>为什么把这个小工具收到这里，而不是让每个消费方各写一遍 try-catch：
+     * 这类值（间隔秒数、水位 MB、CRF…）在录播一处就有十个，
+     * 分散解析的话"非法值怎么办"就会被各写一遍、且很可能不一致（有的抛、有的吞）。
+     * 这里的口径固定为<b>回落到默认值</b>：配置写错不该让功能炸掉，
+     * 但也不能静默变成 0（那会让"关掉"和"写错了"长得一样）——
+     * 所以调用方应当在 {@link #afterConfigChanged} 里回显一次取值。
+     *
+     * <p>取值每次都从 {@link #configMap} 现读，改配置即时生效、不用重启。
+     *
+     * @param key          配置键（用本类里的 {@code KEY_*} 常量）
+     * @param defaultValue 缺失或非法时的取值
+     * @return 解析出的整数，或默认值
+     */
+    public int intOf(String key, int defaultValue) {
+        String raw = configMap.get(key);
+        if (raw == null || raw.isBlank()) {
+            return defaultValue;
+        }
+        try {
+            return Integer.parseInt(raw.trim());
+        } catch (NumberFormatException e) {
+            log.warn("配置 {} 的值 [{}] 不是整数，按默认值 {} 处理", key, raw, defaultValue);
+            return defaultValue;
+        }
+    }
+
+    /**
+     * 读一个<b>字符串配置</b>：键缺失 / 空白都当作"没配"，返回 {@code defaultValue}。
+     *
+     * <p>与 {@code FfmpegProvider#stringOf} 同口径（那里是私有的、语义是"没配返回 null"，
+     * 这里是"没配给默认值"），新增的录播代码统一用这个。
+     */
+    public String stringOf(String key, String defaultValue) {
+        String raw = configMap.get(key);
+        if (raw == null || raw.isBlank()) {
+            return defaultValue;
+        }
+        return raw.trim();
+    }
+
+    /**
      * 更新数据库中的配置
      * @param key 配置键
      * @param value 配置值
@@ -481,6 +781,59 @@ public class LoadDSConfig {
             log.info("ffmpeg 路径已设为 [{}]（⚠️ 该值只在启动时解析一次，重启后生效）", configMap.get(key));
         } else if (KEY_BILI_DOWNLOAD_FFMPEG_URL.equals(key)) {
             log.info("ffmpeg 下载地址已设为 [{}]（⚠️ 自定义地址不做 SHA256 校验，改为「解压 + 能跑」判定）",
+                    configMap.get(key));
+        } else if (KEY_BILI_RECORD_ENABLED.equals(key)) {
+            boolean on = isEnabled(key);
+            log.info("录播总闸已{}（开启后：录播订阅里的主播开播会自动录制，会持续占用磁盘与带宽；"
+                    + "关闭时一个 B 站请求都不发）", on ? "开启" : "关闭");
+            if (on) {
+                // 开启时把决定"会不会把盘写满"的几个数念一遍，省掉"上线后忘了自己配的多少"
+                log.info("录播水位：压缩 {}MB / 硬上限 {}MB / 磁盘下限 {}MB / 并发 {} / 单场上限 {}秒 / 目录 {}",
+                        intOf(KEY_BILI_RECORD_COMPRESS_TOTAL_MB, DEFAULT_RECORD_COMPRESS_TOTAL_MB),
+                        intOf(KEY_BILI_RECORD_HARD_TOTAL_MB, DEFAULT_RECORD_HARD_TOTAL_MB),
+                        intOf(KEY_BILI_RECORD_DISK_MIN_FREE_MB, DEFAULT_RECORD_DISK_MIN_FREE_MB),
+                        intOf(KEY_BILI_RECORD_MAX_CONCURRENT, DEFAULT_RECORD_MAX_CONCURRENT),
+                        intOf(KEY_BILI_RECORD_MAX_SECONDS, DEFAULT_RECORD_MAX_SECONDS),
+                        stringOf(KEY_BILI_RECORD_DIR, DEFAULT_RECORD_DIR));
+            }
+        } else if (KEY_BILI_RECORD_COMPRESS_TOTAL_MB.equals(key)
+                || KEY_BILI_RECORD_HARD_TOTAL_MB.equals(key)
+                || KEY_BILI_RECORD_DISK_MIN_FREE_MB.equals(key)) {
+            log.info("录播水位已改：{} = {}MB（压缩水位 ≤0 = 关闭压缩；硬水位 ≤0 = 不自动删除）",
+                    key, configMap.get(key));
+        } else if (KEY_BILI_RECORD_COMPRESS_HEIGHT.equals(key)
+                || KEY_BILI_RECORD_COMPRESS_CRF.equals(key)
+                || KEY_BILI_RECORD_COMPRESS_PRESET.equals(key)) {
+            log.info("录播压缩参数已改：{} = {}（⚠️ preset 在 4 核机上耗时差别数倍，fast 与 medium 之间能差一倍多）",
+                    key, configMap.get(key));
+        } else if (KEY_BILI_RECORD_DIR.equals(key)) {
+            log.info("录播目录已设为 [{}]（⚠️ 相对进程工作目录，与 ./resources/ 同一口径；"
+                    + "改它不会搬迁已有记录指向的文件，请自行处理）", configMap.get(key));
+        } else if (KEY_BILI_RECORD_PUBLIC_BASE_URL.equals(key)) {
+            log.info("录播下载基址已设为 [{}]（NapCat 会从这个地址拉文件；"
+                    + "NapCat 在容器/别的机器上时这一项最关键）", configMap.get(key));
+        } else if (KEY_BILI_RECORD_DELIVERY_MODE.equals(key)) {
+            log.info("录播交付方式已设为 [{}]（auto/能连就走URL、local/本地路径、url/走内置文件服务、base64/内联）",
+                    configMap.get(key));
+        } else if (KEY_BILI_RECORD_SERVE_PORT.equals(key) || KEY_BILI_RECORD_SERVE_BIND.equals(key)) {
+            log.info("录播文件服务监听已改：{} = {}（⚠️ 该值只在启动时生效，需重启）",
+                    key, configMap.get(key));
+        } else if (KEY_BILI_RECORD_LINK_TTL_MINUTES.equals(key)
+                || KEY_BILI_RECORD_LINK_MAX_USES.equals(key)
+                || KEY_BILI_RECORD_BASE64_MAX_MB.equals(key)) {
+            log.info("录播下载链接参数已改：{} = {}", key, configMap.get(key));
+        } else if (KEY_BILI_RECORD_WEB_ENABLED.equals(key)) {
+            boolean on = isEnabled(key);
+            log.info("录播网页已{}（开启后：拿到链接的人都能浏览/播放/下载本群订阅的录播；"
+                            + "链接可被转发，泄了就重置）",
+                    on ? "开启" : "关闭");
+            if (on) {
+                log.info("⚠️ 网页是挂在 HTTP 服务端口上的，确保它对群成员可达；"
+                        + "推断不出对外基址时用 {} 显式指定（例如 http://你的域名 或 http://1.2.3.4:端口）",
+                        KEY_BILI_RECORD_WEB_BASE_URL);
+            }
+        } else if (KEY_BILI_RECORD_WEB_BASE_URL.equals(key)) {
+            log.info("录播网页基址已设为 [{}]（群里「录播网页」命令发的链接会用它开头）",
                     configMap.get(key));
         }
     }
