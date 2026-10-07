@@ -539,11 +539,20 @@ public class LoadDSConfig {
     /** 默认值：发送滑窗（秒），群/私聊共用。 */
     public static final int DEFAULT_SEND_GUARD_WINDOW_SECONDS = 60;
 
-    /** 默认值：同一群窗口内最多发送条数（标准档）。 */
-    public static final int DEFAULT_SEND_GUARD_GROUP_LIMIT = 20;
+    /** 默认值：<b>推送类</b>（开播/下播/动态/投稿，自动触发、刷屏风险最高）单目标窗口内最多条数。 */
+    public static final int DEFAULT_SEND_GUARD_LIMIT_PUSH = 4;
 
-    /** 默认值：同一私聊对象窗口内最多发送条数（标准档）。 */
-    public static final int DEFAULT_SEND_GUARD_PRIVATE_LIMIT = 10;
+    /** 默认值：<b>签到/今日运势类</b>（指令驱动的回复，活跃群合法量大）单目标窗口内最多条数。 */
+    public static final int DEFAULT_SEND_GUARD_LIMIT_SIGNIN = 12;
+
+    /** 默认值：<b>今日老婆类</b>（指令驱动的回复）单目标窗口内最多条数。 */
+    public static final int DEFAULT_SEND_GUARD_LIMIT_WIFE = 10;
+
+    /** 默认值：<b>其它类</b>（查询/配置/录播等一切未归类发送）单目标窗口内最多条数。 */
+    public static final int DEFAULT_SEND_GUARD_LIMIT_OTHER = 10;
+
+    /** 默认值：私聊目标的<b>上限帽</b> —— 无论类别，私聊窗口内不得超过该值。 */
+    public static final int DEFAULT_SEND_GUARD_PRIVATE_LIMIT = 6;
 
     /** 默认值：同一目标窗口内完全相同内容达到该条数即熔断。 */
     public static final int DEFAULT_SEND_GUARD_DUP_THRESHOLD = 3;
@@ -564,10 +573,26 @@ public class LoadDSConfig {
     /** 配置键：发送滑窗（秒）。不配用 {@link #DEFAULT_SEND_GUARD_WINDOW_SECONDS}。 */
     public static final String KEY_SEND_GUARD_WINDOW_SECONDS = "sendGuardWindowSeconds";
 
-    /** 配置键：单群窗口内最大发送条数。不配用 {@link #DEFAULT_SEND_GUARD_GROUP_LIMIT}。 */
+    /**
+     * 配置键：单群窗口内最大发送条数。<b>@Deprecated 已废弃</b> —— 2.0.3 起按消息类别限流
+     * （{@code sendGuardLimitPush/Signin/Wife/Other}），此键不再被读取。
+     */
+    @Deprecated
     public static final String KEY_SEND_GUARD_GROUP_LIMIT = "sendGuardGroupLimit";
 
-    /** 配置键：单私聊窗口内最大发送条数。不配用 {@link #DEFAULT_SEND_GUARD_PRIVATE_LIMIT}。 */
+    /** 配置键：推送类（开播/下播/动态/投稿）单目标窗口最大条数。不配用 {@link #DEFAULT_SEND_GUARD_LIMIT_PUSH}。 */
+    public static final String KEY_SEND_GUARD_LIMIT_PUSH = "sendGuardLimitPush";
+
+    /** 配置键：签到/今日运势类单目标窗口最大条数。不配用 {@link #DEFAULT_SEND_GUARD_LIMIT_SIGNIN}。 */
+    public static final String KEY_SEND_GUARD_LIMIT_SIGNIN = "sendGuardLimitSignin";
+
+    /** 配置键：今日老婆类单目标窗口最大条数。不配用 {@link #DEFAULT_SEND_GUARD_LIMIT_WIFE}。 */
+    public static final String KEY_SEND_GUARD_LIMIT_WIFE = "sendGuardLimitWife";
+
+    /** 配置键：其它类单目标窗口最大条数。不配用 {@link #DEFAULT_SEND_GUARD_LIMIT_OTHER}。 */
+    public static final String KEY_SEND_GUARD_LIMIT_OTHER = "sendGuardLimitOther";
+
+    /** 配置键：私聊目标上限帽（任何类别私聊都不超过）。不配用 {@link #DEFAULT_SEND_GUARD_PRIVATE_LIMIT}。 */
     public static final String KEY_SEND_GUARD_PRIVATE_LIMIT = "sendGuardPrivateLimit";
 
     /** 配置键：相同内容熔断条数。不配用 {@link #DEFAULT_SEND_GUARD_DUP_THRESHOLD}。 */
@@ -988,9 +1013,16 @@ public class LoadDSConfig {
                     + "熔断时私信告警所有者；关闭时全部发送直通）",
                     isEnabled(key, true) ? "开启" : "关闭");
         } else if (KEY_SEND_GUARD_WINDOW_SECONDS.equals(key) || KEY_SEND_GUARD_GROUP_LIMIT.equals(key)
+                || KEY_SEND_GUARD_LIMIT_PUSH.equals(key) || KEY_SEND_GUARD_LIMIT_SIGNIN.equals(key)
+                || KEY_SEND_GUARD_LIMIT_WIFE.equals(key) || KEY_SEND_GUARD_LIMIT_OTHER.equals(key)
                 || KEY_SEND_GUARD_PRIVATE_LIMIT.equals(key) || KEY_SEND_GUARD_DUP_THRESHOLD.equals(key)
                 || KEY_SEND_GUARD_CIRCUIT_SECONDS.equals(key) || KEY_SEND_GUARD_ALERT_COOLDOWN_MINUTES.equals(key)) {
-            log.info("出站发送熔断参数已改：{} = {}", key, configMap.get(key));
+            if (KEY_SEND_GUARD_GROUP_LIMIT.equals(key)) {
+                log.info("⚠️ {} 已废弃（2.0.3 起按类别限流：sendGuardLimitPush/Signin/Wife/Other），此改动不生效",
+                        key);
+            } else {
+                log.info("出站发送熔断参数已改：{} = {}", key, configMap.get(key));
+            }
         }
     }
 

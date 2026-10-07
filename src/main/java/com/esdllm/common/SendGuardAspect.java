@@ -41,7 +41,9 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <p><b>判定规则</b>（按目标维度：群 {@code g:<id>} / 私聊 {@code p:<id>}，各一个滑窗）：
  * <ol>
- *   <li><b>频率</b>：窗口（默认 60s）内发往同一目标超过阈值（群 20 / 私聊 10）⇒ 熔断；</li>
+ *   <li><b>频率</b>：窗口（默认 60s）内发往同一目标超过阈值 ⇒ 熔断。阈值<b>按消息类别</b>分档
+ *       （调用方插件经 StackWalker 识别）：推送 push=4（自动触发、风险最高、最严）/
+ *       签到运势 signin=12 / 今日老婆 wife=10 / 其它 other=10；私聊目标再扣上限帽 6；</li>
  *   <li><b>重复</b>：窗口内完全相同内容（SHA-1 指纹）达到阈值（默认 3）⇒ 熔断。</li>
  * </ol>
  * 熔断 = 之后 {@code sendGuardCircuitSeconds}（默认 60s）内发往该目标的消息<b>一律丢弃</b>，
@@ -68,6 +70,21 @@ public class SendGuardAspect {
     private static final Set<String> SEND_ACTIONS = Set.of(
             "send_group_msg", "send_private_msg",
             "send_group_forward_msg", "send_private_forward_msg", "send_forward_msg");
+
+    // ------------------------------------------------------------------ 消息类别（按调用方插件归类）
+
+    /** 类别：推送（开播/下播/动态/投稿 —— 自动触发、刷屏风险最高，阈值最严） */
+    static final String CAT_PUSH = "push";
+    /** 类别：签到/今日运势（指令驱动回复） */
+    static final String CAT_SIGNIN = "signin";
+    /** 类别：今日老婆（指令驱动回复） */
+    static final String CAT_WIFE = "wife";
+    /** 类别：其它（查询/配置/录播等一切未归类发送） */
+    static final String CAT_OTHER = "other";
+
+    /** 用于按调用方归类的 StackWalker（保留 Class 引用，按包名过滤） */
+    private static final StackWalker STACK_WALKER =
+            StackWalker.getInstance(StackWalker.Option.RETAIN_CLASS_REFERENCE);
 
     /** 每个目标滑窗的最大保留条数（防内存被异常流量撑大；正常远到不了） */
     private static final int MAX_WINDOW_ENTRIES = 500;
@@ -136,12 +153,13 @@ public class SendGuardAspect {
                         && SEND_ACTIONS.contains(action.getPath())) {
                     @SuppressWarnings("unchecked")
                     Map<String, Object> params = (Map<String, Object>) args[2];
-                    Trip trip = check(params);
+                    String category = resolveCategory();
+                    Trip trip = check(params, category);
                     if (trip != null) {
                         String target = targetOf(params);
                         if (trip.reason() != TripReason.CIRCUIT) {
                             // 新熔断：告警；CIRCUIT 是熔断期内的常规丢弃，不重复告警
-                            alert(session, target, action.getPath(), trip);
+                            alert(session, target, action.getPath(), trip, category);
                         }
                         return blockedResult(trip);
                     }
@@ -160,14 +178,23 @@ public class SendGuardAspect {
      * <p>顺序：熔断中 ⇒ 直接丢（计数 suppressed）；否则滑窗计数 + 重复指纹判定，
      * 越线则置熔断并返回原因。本次越线的那条<b>也被丢弃</b>（它正是刷屏的一部分）。
      */
-    private Trip check(Map<String, Object> params) {
+    /**
+     * 判定一次发送。返回 {@code null} 放行，否则熔断/丢弃。
+     *
+     * <p>顺序：熔断中 ⇒ 直接丢（计数 suppressed）；否则滑窗计数 + 重复指纹判定，
+     * 越线则置熔断并返回原因。本次越线的那条<b>也被丢弃</b>（它正是刷屏的一部分）。
+     *
+     * @param category 消息类别（{@link #CAT_PUSH}/{@link #CAT_SIGNIN}/{@link #CAT_WIFE}/{@link #CAT_OTHER}），
+     *                 由 {@link #resolveCategory()} 按调用方插件判定；探针测试可直接指定
+     */
+    private Trip check(Map<String, Object> params, String category) {
         String target = targetOf(params);
         if (target == null) {
             return null; // 提取不到目标的发送（理论上不会），不拦
         }
         long now = System.currentTimeMillis();
         long windowMillis = windowSeconds() * 1000L;
-        int limit = target.charAt(0) == 'g' ? groupLimit() : privateLimit();
+        int limit = limitFor(category, target.charAt(0) == 'g');
         int dupLimit = dupThreshold();
         long circuitMillis = circuitSeconds() * 1000L;
 
@@ -217,6 +244,64 @@ public class SendGuardAspect {
             }
         }
         return null;
+    }
+
+    /**
+     * 按调用方插件归类本次发送。沿调用栈找第一个 {@code com.esdllm} 业务类
+     * （跳过本切面与 shiro 的 Bot/代理帧），按类名映射类别；找不到归 {@link #CAT_OTHER}。
+     *
+     * <p>为什么用 StackWalker 而不是改 30 个调用点：出口切面看到的只有 target+content，
+     * 谁发的得从栈里认；插件类名稳定，映射错不了。
+     */
+    private static String resolveCategory() {
+        return STACK_WALKER.walk(frames -> frames
+                .map(StackWalker.StackFrame::getDeclaringClass)
+                .filter(c -> c.getName().startsWith("com.esdllm.") && c != SendGuardAspect.class)
+                .findFirst()
+                .map(c -> categoryOfClass(c.getName()))
+                .orElse(CAT_OTHER));
+    }
+
+    /** 类名 → 类别。推送服务与推送插件都算 push；签到/老婆各归各。 */
+    static String categoryOfClass(String className) {
+        if (className.contains("PushInfoServiceImpl") || className.contains("BiliBiliPushPlugins")) {
+            return CAT_PUSH;
+        }
+        if (className.contains("SignInPlugins")) {
+            return CAT_SIGNIN;
+        }
+        if (className.contains("TodayWifePlugins")) {
+            return CAT_WIFE;
+        }
+        return CAT_OTHER;
+    }
+
+    /** 类别文案（告警/日志用）。 */
+    private static String categoryText(String category) {
+        return switch (category) {
+            case CAT_PUSH -> "推送";
+            case CAT_SIGNIN -> "签到/运势";
+            case CAT_WIFE -> "今日老婆";
+            default -> "其它";
+        };
+    }
+
+    /** 限流值：类别阈值；私聊目标再扣 {@code sendGuardPrivateLimit} 上限帽。 */
+    private int limitFor(String category, boolean isGroup) {
+        int base = switch (category) {
+            case CAT_PUSH -> loadDSConfig.intOf(LoadDSConfig.KEY_SEND_GUARD_LIMIT_PUSH,
+                    LoadDSConfig.DEFAULT_SEND_GUARD_LIMIT_PUSH);
+            case CAT_SIGNIN -> loadDSConfig.intOf(LoadDSConfig.KEY_SEND_GUARD_LIMIT_SIGNIN,
+                    LoadDSConfig.DEFAULT_SEND_GUARD_LIMIT_SIGNIN);
+            case CAT_WIFE -> loadDSConfig.intOf(LoadDSConfig.KEY_SEND_GUARD_LIMIT_WIFE,
+                    LoadDSConfig.DEFAULT_SEND_GUARD_LIMIT_WIFE);
+            default -> loadDSConfig.intOf(LoadDSConfig.KEY_SEND_GUARD_LIMIT_OTHER,
+                    LoadDSConfig.DEFAULT_SEND_GUARD_LIMIT_OTHER);
+        };
+        if (!isGroup) {
+            base = Math.min(base, privateLimit());
+        }
+        return base;
     }
 
     /** 目标标识：群消息 {@code g:<groupId>}，私聊 {@code p:<userId>}；提取不到返回 {@code null}。 */
@@ -274,22 +359,23 @@ public class SendGuardAspect {
      * <p>用 {@code botFactory.createBot(selfId, session)} 基于当前会话临时建 Bot 发私信；
      * 发送前置 {@link #bypass} —— 告警必须发得出去，哪怕"所有者私聊"目标本身已被熔断。
      */
-    private void alert(WebSocketSession session, String target, String actionPath, Trip trip) {
+    private void alert(WebSocketSession session, String target, String actionPath, Trip trip, String category) {
         long now = System.currentTimeMillis();
         long cooldownMillis = alertCooldownMinutes() * 60_000L;
         Long last = lastAlertAt.get(target);
         if (last != null && now - last < cooldownMillis) {
-            log.warn("发送熔断（告警冷却中，仅记日志）：{} {}", target, describeReason(trip));
+            log.warn("发送熔断（告警冷却中，仅记日志）：{} {} {}", target, categoryText(category), describeReason(trip));
             return;
         }
         String text = "🚨 发送熔断触发\n"
                 + "目标：" + ("g:".equals(target.substring(0, 2))
                         ? "群 " + target.substring(2) : "私聊 " + target.substring(2)) + "\n"
+                + "类别：" + categoryText(category) + "\n"
                 + "原因：" + describeReason(trip) + "\n"
                 + "动作：接下来 " + circuitSeconds() + " 秒内发往该目标的消息全部丢弃，之后自动恢复\n"
                 + "建议：检查最近部署/推送任务是否有循环发送 bug\n"
                 + "（出自 " + actionPath + "；调阈值用配置键 sendGuard*，总闸 sendGuardEnabled）";
-        log.warn("发送熔断触发：{} {}（{}）", target, describeReason(trip), actionPath);
+        log.warn("发送熔断触发：{} [{}] {}（{}）", target, category, describeReason(trip), actionPath);
 
         Long owner = resolveOwnerQq();
         if (owner == null) {
@@ -359,11 +445,6 @@ public class SendGuardAspect {
     private int windowSeconds() {
         return loadDSConfig.intOf(LoadDSConfig.KEY_SEND_GUARD_WINDOW_SECONDS,
                 LoadDSConfig.DEFAULT_SEND_GUARD_WINDOW_SECONDS);
-    }
-
-    private int groupLimit() {
-        return loadDSConfig.intOf(LoadDSConfig.KEY_SEND_GUARD_GROUP_LIMIT,
-                LoadDSConfig.DEFAULT_SEND_GUARD_GROUP_LIMIT);
     }
 
     private int privateLimit() {

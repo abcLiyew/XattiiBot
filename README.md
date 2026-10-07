@@ -214,15 +214,26 @@ antiSpamAlertCooldownMinutes / antiSpamGroups / antiSpamUserLimits / antiSpamGro
 
 ### 发送熔断：无需操作，了解即可
 
-- **规则**（按目标各一个 60 秒滑窗，标准档）：同一群 >20 条、同一私聊 >10 条 ⇒ 频率熔断；
-  完全相同内容 ≥3 条 ⇒ 重复熔断（当年"每 10 秒发一条下播通知"的事故，两个规则都能在第 3 条掐断）。
-- **熔断** = 之后 60 秒内发往该目标的消息一律丢弃，自动恢复；触发时私信告警所有者，
-  熔断解除时日志记录"挡了多少条"。
+- **规则**（按目标各一个 60 秒滑窗）：阈值**按消息类别**分档（调用方插件经调用栈自动识别，
+  30 个发送点零改动）——
+
+  | 类别 | 涵盖 | 默认阈值（条/60s/目标） | 配置键 |
+  |---|---|---|---|
+  | 推送 push | 开播/下播/动态/投稿（自动触发，风险最高） | **4** | `sendGuardLimitPush` |
+  | 签到/运势 signin | 签到、查询、今日运势（指令驱动回复） | 12 | `sendGuardLimitSignin` |
+  | 今日老婆 wife | 今日老婆（指令驱动回复） | 10 | `sendGuardLimitWife` |
+  | 其它 other | 查询/配置/录播等未归类发送 | 10 | `sendGuardLimitOther` |
+  | 私聊上限帽 | 任何类别的私聊目标 | 6 | `sendGuardPrivateLimit` |
+
+  完全相同内容 ≥3 条 ⇒ 重复熔断（与类别无关）。当年"每 10 秒发一条下播通知"的事故
+  （稳态 6 条/分钟），频率 + 重复两条规则都能在第 3~5 条掐断。
+- **熔断** = 之后 60 秒内发往该目标的消息一律丢弃，自动恢复；触发时私信告警所有者
+  （含类别），熔断解除时日志记录"挡了多少条"。
 - **被拦消息不抛异常**：返回与发送失败同形的 `retcode=-1` 结果，业务代码无感知。
 - **fail-safe**：熔断器自身任何异常一律放行 —— 宁可不熔断，绝不误伤正常发送。
-- 配置键（热更，一般不用动）：`sendGuardEnabled`（默认开）/ `sendGuardWindowSeconds`（60）/
-  `sendGuardGroupLimit`（20）/ `sendGuardPrivateLimit`（10）/ `sendGuardDupThreshold`（3）/
-  `sendGuardCircuitSeconds`（60）/ `sendGuardAlertCooldownMinutes`（5）。
+- 其它配置键（热更，一般不用动）：`sendGuardEnabled`（默认开）/ `sendGuardWindowSeconds`（60）/
+  `sendGuardDupThreshold`（3）/ `sendGuardCircuitSeconds`（60）/ `sendGuardAlertCooldownMinutes`（5）。
+  ⚠️ `sendGuardGroupLimit` 已废弃（2.0.3 起按类别限流）。
 
 ## 直播录播
 
