@@ -44,3 +44,4 @@ build/
 /build.log
 /.idea/
 /logs/
+/bin/
