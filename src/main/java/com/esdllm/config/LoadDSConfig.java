@@ -441,6 +441,144 @@ public class LoadDSConfig {
      */
     public static final String KEY_BILI_RECORD_WEB_BASE_URL = "biliRecordWebBaseUrl";
 
+    // ------------------------------------------------------------------ 反刷屏（AntiSpam）
+
+    /** 默认滑窗（秒）：频率与去重都按这个时间窗统计 */
+    public static final int DEFAULT_ANTI_SPAM_WINDOW_SECONDS = 60;
+    /** 默认告警冷却（分钟）：同一群同一原因在这个时长内最多告警一次，避免机器人自己刷屏 */
+    public static final int DEFAULT_ANTI_SPAM_ALERT_COOLDOWN_MINUTES = 5;
+    /** 默认相同消息阈值（次）：同一内容在滑窗内出现这么多次才判"重复刷屏" */
+    public static final int DEFAULT_ANTI_SPAM_DUP_THRESHOLD = 3;
+    /** 默认动作级别：仅告警 */
+    public static final String DEFAULT_ANTI_SPAM_ACTION = "alert";
+    /** 默认单人阈值（{@code 类型:条数} 逗号分隔，{@code other} 为未列出类型的兜底） */
+    public static final String DEFAULT_ANTI_SPAM_USER_LIMITS =
+            "image:6,forward:2,video:3,record:5,share:3,face:8,text:12,command:5,other:15";
+    /** 默认全群阈值 */
+    public static final String DEFAULT_ANTI_SPAM_GROUP_LIMITS =
+            "image:20,forward:5,video:10,record:15,share:8,face:30,text:40,command:15,other:50";
+
+    /**
+     * 配置键：<b>反刷屏总闸</b>。取值 {@code true/1/on/yes} 才开，<b>默认关</b>。
+     *
+     * <p><b>为什么默认关</b>：它会读<b>每一条</b>群消息并做统计，属于"装上就改变行为"的功能，
+     * 与本项目其它所有开关同一条纪律 —— 想让谁监控谁自己开。
+     * 关掉后检测钩子在入口直接返回，不做任何统计、一个告警都不发。
+     *
+     * <p>改动即时生效（每条消息现读），不需要重启。
+     */
+    public static final String KEY_ANTI_SPAM_ENABLED = "antiSpamEnabled";
+
+    /**
+     * 配置键：命中后的<b>处置级别</b>，取值 {@code alert}（默认）/ {@code recall} / {@code ban}。
+     *
+     * <ul>
+     *   <li>{@code alert}：只私信机器人所有者，不动任何消息（最安全，建议先用这个跑一阵看误报）；</li>
+     *   <li>{@code recall}：alert 之上再撤回那条触发消息 —— <b>要求机器人是群管理员</b>；</li>
+     *   <li>{@code ban}：recall 之上再对发送者禁言 10 分钟 —— 同样要求群管理员，<b>误伤代价最大</b>。</li>
+     * </ul>
+     *
+     * <p>⚠️ QQ 拦不住<b>已发出</b>的消息，所谓"拦截"只能事后撤回 / 禁言，这两个都要群管理权限。
+     * 填别的值一律按 {@code alert} 处理（fail-safe）。
+     */
+    public static final String KEY_ANTI_SPAM_ACTION = "antiSpamAction";
+
+    /**
+     * 配置键：<b>统计滑窗（秒）</b>，默认 {@code 60}。
+     *
+     * <p>窗口越大越能容忍瞬时小爆发、但反应越慢；越小越灵敏、越容易把"正常的热闹"误报成刷屏。
+     */
+    public static final String KEY_ANTI_SPAM_WINDOW_SECONDS = "antiSpamWindowSeconds";
+
+    /**
+     * 配置键：<b>告警冷却（分钟）</b>，默认 {@code 5}。
+     *
+     * <p>同一群同一原因（类型/重复）在冷却期内只告警一次 —— 刷屏是持续的，没有这道冷却
+     * 机器人会把所有者的私信箱刷爆，那就本末倒置了。
+     */
+    public static final String KEY_ANTI_SPAM_ALERT_COOLDOWN_MINUTES = "antiSpamAlertCooldownMinutes";
+
+    /**
+     * 配置键：<b>相同消息阈值（次）</b>，默认 {@code 3}。
+     *
+     * <p>同一内容（全群维度，归一化后取指纹）在滑窗内出现这么多次，判"重复刷屏"。
+     */
+    public static final String KEY_ANTI_SPAM_DUP_THRESHOLD = "antiSpamDupThreshold";
+
+    /**
+     * 配置键：<b>监控群白名单</b>，逗号分隔的群号；<b>留空 = 所有群</b>。
+     *
+     * <p>豁免（机器人自己 / 群主 / 群管理员 / {@code admin} 表白名单）与这个白名单是<b>两回事</b>：
+     * 白名单决定"管哪些群"，豁免决定"群里哪些人不算"。
+     */
+    public static final String KEY_ANTI_SPAM_GROUPS = "antiSpamGroups";
+
+    /**
+     * 配置键：<b>单人频率阈值</b>，格式 {@code 类型:条数}、逗号分隔
+     * （如 {@code image:6,forward:2,text:12}），未列出的类型用 {@code other} 兜底。
+     *
+     * <p>类型取值：{@code image / forward / video / record / share / face / text / command / other}。
+     * 不配则用 {@link #DEFAULT_ANTI_SPAM_USER_LIMITS}。
+     */
+    public static final String KEY_ANTI_SPAM_USER_LIMITS = "antiSpamUserLimits";
+
+    /**
+     * 配置键：<b>全群频率阈值</b>，格式同 {@link #KEY_ANTI_SPAM_USER_LIMITS}。
+     *
+     * <p>防的是"多人一起轰炸 / 病毒式转发" —— 单看单人阈值拦不住这种。
+     * 不配则用 {@link #DEFAULT_ANTI_SPAM_GROUP_LIMITS}。
+     */
+    public static final String KEY_ANTI_SPAM_GROUP_LIMITS = "antiSpamGroupLimits";
+
+    // ==================== 出站发送熔断（SendGuard，防机器人自己刷屏） ====================
+    // 与入站反刷屏（antiSpam*）的区别：那套防"别人刷"，这套防"自己刷"——
+    // 任何推送循环 bug / 设计缺陷导致机器人向同一目标高频/重复发送时，
+    // 在 ActionHandler.action 出口处熔断 60s 并私信告警所有者。
+    // 保险丝定位 ⇒ 默认开（只在异常频率时动作，正常业务远低于阈值）。
+
+    /** 默认值：发送滑窗（秒），群/私聊共用。 */
+    public static final int DEFAULT_SEND_GUARD_WINDOW_SECONDS = 60;
+
+    /** 默认值：同一群窗口内最多发送条数（标准档）。 */
+    public static final int DEFAULT_SEND_GUARD_GROUP_LIMIT = 20;
+
+    /** 默认值：同一私聊对象窗口内最多发送条数（标准档）。 */
+    public static final int DEFAULT_SEND_GUARD_PRIVATE_LIMIT = 10;
+
+    /** 默认值：同一目标窗口内完全相同内容达到该条数即熔断。 */
+    public static final int DEFAULT_SEND_GUARD_DUP_THRESHOLD = 3;
+
+    /** 默认值：熔断时长（秒），期间发往该目标的消息一律丢弃。 */
+    public static final int DEFAULT_SEND_GUARD_CIRCUIT_SECONDS = 60;
+
+    /** 默认值：同一目标熔断告警冷却（分钟）。 */
+    public static final int DEFAULT_SEND_GUARD_ALERT_COOLDOWN_MINUTES = 5;
+
+    /**
+     * 配置键：<b>出站发送熔断总闸</b>。1 开 / 0 关，<b>缺省开</b>（保险丝常开）。
+     *
+     * <p>关闭后所有发送直通，不做任何统计。
+     */
+    public static final String KEY_SEND_GUARD_ENABLED = "sendGuardEnabled";
+
+    /** 配置键：发送滑窗（秒）。不配用 {@link #DEFAULT_SEND_GUARD_WINDOW_SECONDS}。 */
+    public static final String KEY_SEND_GUARD_WINDOW_SECONDS = "sendGuardWindowSeconds";
+
+    /** 配置键：单群窗口内最大发送条数。不配用 {@link #DEFAULT_SEND_GUARD_GROUP_LIMIT}。 */
+    public static final String KEY_SEND_GUARD_GROUP_LIMIT = "sendGuardGroupLimit";
+
+    /** 配置键：单私聊窗口内最大发送条数。不配用 {@link #DEFAULT_SEND_GUARD_PRIVATE_LIMIT}。 */
+    public static final String KEY_SEND_GUARD_PRIVATE_LIMIT = "sendGuardPrivateLimit";
+
+    /** 配置键：相同内容熔断条数。不配用 {@link #DEFAULT_SEND_GUARD_DUP_THRESHOLD}。 */
+    public static final String KEY_SEND_GUARD_DUP_THRESHOLD = "sendGuardDupThreshold";
+
+    /** 配置键：熔断时长（秒）。不配用 {@link #DEFAULT_SEND_GUARD_CIRCUIT_SECONDS}。 */
+    public static final String KEY_SEND_GUARD_CIRCUIT_SECONDS = "sendGuardCircuitSeconds";
+
+    /** 配置键：熔断告警冷却（分钟）。不配用 {@link #DEFAULT_SEND_GUARD_ALERT_COOLDOWN_MINUTES}。 */
+    public static final String KEY_SEND_GUARD_ALERT_COOLDOWN_MINUTES = "sendGuardAlertCooldownMinutes";
+
 
     @Value(value = "${bot.qq}")
     Long botQQ;
@@ -835,6 +973,24 @@ public class LoadDSConfig {
         } else if (KEY_BILI_RECORD_WEB_BASE_URL.equals(key)) {
             log.info("录播网页基址已设为 [{}]（群里「录播网页」命令发的链接会用它开头）",
                     configMap.get(key));
+        } else if (KEY_ANTI_SPAM_ENABLED.equals(key)) {
+            log.info("反刷屏总闸已{}（开启后：每条群消息都会做频率/重复统计，命中按 antiSpamAction 处置；"
+                    + "关闭时入口直接返回、不做任何统计）", isEnabled(key) ? "开启" : "关闭");
+        } else if (KEY_ANTI_SPAM_ACTION.equals(key)) {
+            log.info("反刷屏处置级别已设为 [{}]（alert=仅告警 / recall=+撤回 / ban=+禁言，后两者要求机器人是群管理员）",
+                    configMap.get(key));
+        } else if (KEY_ANTI_SPAM_WINDOW_SECONDS.equals(key) || KEY_ANTI_SPAM_DUP_THRESHOLD.equals(key)
+                || KEY_ANTI_SPAM_ALERT_COOLDOWN_MINUTES.equals(key) || KEY_ANTI_SPAM_GROUPS.equals(key)
+                || KEY_ANTI_SPAM_USER_LIMITS.equals(key) || KEY_ANTI_SPAM_GROUP_LIMITS.equals(key)) {
+            log.info("反刷屏参数已改：{} = {}", key, configMap.get(key));
+        } else if (KEY_SEND_GUARD_ENABLED.equals(key)) {
+            log.info("出站发送熔断总闸已{}（开启后：同一目标 60s 内超频发信或重复内容将被丢弃并熔断 60s，"
+                    + "熔断时私信告警所有者；关闭时全部发送直通）",
+                    isEnabled(key, true) ? "开启" : "关闭");
+        } else if (KEY_SEND_GUARD_WINDOW_SECONDS.equals(key) || KEY_SEND_GUARD_GROUP_LIMIT.equals(key)
+                || KEY_SEND_GUARD_PRIVATE_LIMIT.equals(key) || KEY_SEND_GUARD_DUP_THRESHOLD.equals(key)
+                || KEY_SEND_GUARD_CIRCUIT_SECONDS.equals(key) || KEY_SEND_GUARD_ALERT_COOLDOWN_MINUTES.equals(key)) {
+            log.info("出站发送熔断参数已改：{} = {}", key, configMap.get(key));
         }
     }
 

@@ -16,6 +16,12 @@ XatiiBot 是一个基于 Java 开发的 QQ 机器人，主要用于解析和分�
 - 动态解析 ：解析 Bilibili 动态链接，显示动态内容和发布者信息
 - 短链接解析 ：支持解析 b23.tv 短链接
 - 直播 / 动态订阅推送 ：为指定 B 站房间添加订阅，开播、下播、投稿与动态自动推送到群聊或私聊
+- 直播录播 ：订阅的主播开播自动录（flv 流式落盘、取用才转 mp4），全局容量自管理
+  （超阈值先压缩、再清最旧），附只读录播网页；ffmpeg 缺失时后台自动下载
+- 反刷屏（入站） ：群消息按类型做滑窗频率统计 + 相同消息全群去重，命中分级处置
+  （默认仅私信告警机器人所有者），全部参数对话即可配置
+- 发送熔断（出站） ：机器人自身的发送保险丝 —— 任何 bug / 设计缺陷导致向同一目标
+  高频或重复发消息时，自动熔断 60 秒并私信告警所有者；**默认开启**
 - 群签到养成 ：群内提供「签到 / 查询 / 今日运势」互动，累计好感度并划分等级与态度
 - B 站凭据管理 ：私聊发「登录」用哔哩哔哩 App 扫码刷新 Cookie（仅机器人所有者），也支持管理员的
   「设置cookie / cookie状态 / 清除cookie」命令；Cookie 失效自动探测并提示
@@ -93,6 +99,15 @@ XatiiBot 是一个基于 Java 开发的 QQ 机器人，主要用于解析和分�
 - BiliSearchPlugins ：处理「搜视频 / 热搜 / 今日热门」三条只读查询指令
 - CredentialGuard ：B 站凭据探测与缓存的统一入口（事件驱动 + 定时兜底）
 - SignInPlugins ：处理「签到 / 查询 / 今日运势」指令，维护群内好感度
+- AntiSpamPlugins ：反刷屏（入站）—— 每条群消息的分类、滑窗计数、相同消息去重与分级处置
+  （告警 / 撤回 / 禁言），「反刷屏」系列命令对话配置
+- SendGuardAspect ：发送熔断（出站）—— 一个 AOP 切面包住 shiro 全部发送方法的唯一汇入口
+  `ActionHandler.action(..)`，按目标滑窗限频 + 重复内容熔断，零调用点改动
+- LiveRecordPlugins / LiveRecordServiceImpl ：「录播订阅 / 录播列表 / 录播下载 …」命令与
+  录制调度（开播自动起 ffmpeg、断流自查、容量压缩/清理）；RecordFileServer 是内置只读文件服务，
+  RecordWebController 提供录播网页
+- FfmpegProvider ：ffmpeg 运行时获取与探活（配置路径 → `./bin/ffmpeg` 缓存 → PATH →
+  后台自动下载，原子落盘），录播与转码共用
 - PushInfoServiceImpl ：订阅的增删与推送逻辑，含管理员鉴权
 - SignInRecordsServiceImpl ：签到数据读写与好感度结算
 - BotAdminChecker ：统一的管理权限判定（订阅、Cookie 配置等敏感操作共用一份规则）
@@ -159,6 +174,84 @@ INSERT INTO config(key, value) VALUES ('biliAnalysisWithSummary', 'true');
 键不存在、值为空、拼错（如 `ture`）一律按**关**处理 —— 免得"配置写错反而把请求量放大"。
 开关状态可在启动日志、改配置时的回显、或直接发「开关」命令确认（AI 摘要那项还会额外报一句 Cookie 有没有配）。
 
+## 防刷屏双保险：反刷屏（防别人）+ 发送熔断（防自己）
+
+两套机制方向相反、互不替代：
+
+| | 反刷屏 AntiSpam（入站） | 发送熔断 SendGuard（出站） |
+|---|---|---|
+| 防谁 | **群友**刷屏（斗图轰炸、病毒转发、恶意调机器人） | **机器人自己**刷屏（推送循环 bug、设计缺陷） |
+| 拦截点 | 每条群消息（`@AnyMessageHandler`） | 全部发送调用的唯一汇入口（AOP 切 `ActionHandler.action`） |
+| 默认状态 | **关**（「反刷屏 开」启用） | **开**（保险丝常开，正常业务远低于阈值零感知） |
+| 命中动作 | 分级：alert 仅告警 → recall +撤回 → ban +禁言 10 分钟 | 丢弃消息并熔断该目标 60 秒，自动恢复 |
+| 告警 | 私信机器人所有者（`admin` 表 `group_id` 为空那条），5 分钟冷却 | 同左 |
+
+### 反刷屏：对话配置（推荐）
+
+**只允许 `admin` 表里的管理员**使用（与「设置cookie」同一权限口径），全部即时生效：
+
+```
+反刷屏                                ← 状态面板（总闸/动作/阈值/告警对象一览）
+反刷屏 开 ｜ 反刷屏 关                 ← 总闸
+反刷屏 动作 alert                     ← 处置级别：alert / recall / ban（后两者要求机器人是群管理员）
+反刷屏 设置 窗口 60                   ← 滑窗秒数（5~3600）
+反刷屏 设置 去重 3                    ← 窗口内相同消息达到几条触发（2~100）
+反刷屏 设置 冷却 5                    ← 告警冷却分钟数（1~1440）
+反刷屏 设置 监控群 123,456            ← 只监控这些群；「全部」= 所有群
+反刷屏 设置 单人阈值 image:6,text:12  ← 单人×类型阈值表
+反刷屏 设置 全群阈值 image:20,text:40 ← 全群×类型阈值表
+```
+
+类型取值：`image / forward / video / record / share / face / text / command / other`
+（`command` = @ 机器人的消息，单独一套阈值防恶意调机器人）。
+默认阈值：单人 `image:6, forward:2, video:3, record:5, share:3, face:8, text:12, command:5, other:15`；
+全群 `image:20, forward:5, video:10, record:15, share:8, face:30, text:40, command:15, other:50`。
+对应配置键：`antiSpamEnabled / antiSpamAction / antiSpamWindowSeconds / antiSpamDupThreshold /
+antiSpamAlertCooldownMinutes / antiSpamGroups / antiSpamUserLimits / antiSpamGroupLimits`。
+
+> 建议先保持 `alert` 跑一阵看误报，可信再升 `recall` —— 撤回/禁言都要求机器人是目标群的管理员。
+> 机器人自己、群主/群管理员、`admin` 表白名单永远豁免检测。
+
+### 发送熔断：无需操作，了解即可
+
+- **规则**（按目标各一个 60 秒滑窗，标准档）：同一群 >20 条、同一私聊 >10 条 ⇒ 频率熔断；
+  完全相同内容 ≥3 条 ⇒ 重复熔断（当年"每 10 秒发一条下播通知"的事故，两个规则都能在第 3 条掐断）。
+- **熔断** = 之后 60 秒内发往该目标的消息一律丢弃，自动恢复；触发时私信告警所有者，
+  熔断解除时日志记录"挡了多少条"。
+- **被拦消息不抛异常**：返回与发送失败同形的 `retcode=-1` 结果，业务代码无感知。
+- **fail-safe**：熔断器自身任何异常一律放行 —— 宁可不熔断，绝不误伤正常发送。
+- 配置键（热更，一般不用动）：`sendGuardEnabled`（默认开）/ `sendGuardWindowSeconds`（60）/
+  `sendGuardGroupLimit`（20）/ `sendGuardPrivateLimit`（10）/ `sendGuardDupThreshold`（3）/
+  `sendGuardCircuitSeconds`（60）/ `sendGuardAlertCooldownMinutes`（5）。
+
+## 直播录播
+
+订阅的主播开播自动录，录 **flv**（流式可写、断电可播），取用才 `-c copy` 转 mp4；
+ffmpeg 退出后 worker 会**再查一次开播状态**区分"网络抖动断流"与"主播下播"，避免一场录成碎片。
+
+```
+录播订阅 22603245            ← 给本群添加录播订阅（管理员）
+录播订阅列表                 ← 本群订阅一览
+录播取消订阅 22603245
+录播开关 22603245 关         ← 临时停录某房间，不删订阅
+录播列表 [房间号]            ← 本群可见的录播文件（一场一行，fid 标识）
+录播下载 <fid>               ← 转 mp4 并交付（自动选 URL/本地路径/base64）
+录播保留 <fid>               ← 标记保留：容量清理时跳过
+删除录播 <fid>               ← 删记录同时删文件目录
+录播状态                     ← 正在录 / 容量 / ffmpeg 状态一览
+录播整理                     ← 立即跑一次容量管理（压缩→清理）
+录播网页                     ← 发一个带令牌的网页链接：本群订阅录播的浏览/播放/下载
+```
+
+容量自管理（全局维度，`live_record_file` 汇总）：总量超 `biliRecordCompressTotalMb`（默认 15GB）
+先压缩老文件（降分辨率 + CRF，**只降不升**）；仍超 `biliRecordHardTotalMb`（默认 25GB）删最早的
+（`keep=1` 保留的除外）。主要配置键：`biliRecordEnabled`（录播总闸）/ `biliRecordDir`（落盘目录）/
+`biliRecordMaxConcurrent`（同录上限）/ `biliRecordDeliveryMode`（`auto/local/url/base64`）/
+`biliRecordWebEnabled` + `biliRecordWebBaseUrl`（录播网页与对外基址）。
+
+> ffmpeg 不用自己装：`FfmpegProvider` 启动时探活「配置路径 → `./bin/ffmpeg` 缓存 → PATH」，
+> 都没有就后台自动下载静态构建（原子落盘，下好前录播报"ffmpeg 不可用"而不是写坏文件）。
+
 ## 使用方法
 
 ### 方式一：直接用 Release 里的 jar（推荐）
@@ -178,7 +271,8 @@ INSERT INTO config(key, value) VALUES ('biliAnalysisWithSummary', 'true');
    ```
    首次启动会自动做完这些：
    - 建好 `./resources/` 目录和 `./resources/xatiiBot.db`（SQLite，**不用单独装数据库**）；
-   - 建 4 张表（`admin` / `config` / `push_info` / `sign_in_records`）并建好索引；
+   - 建好全部表（`admin` / `config` / `push_info` / `sign_in_records` /
+     `live_record_sub` / `live_record_file` / `record_web_token`）与索引；
    - 日志写到 `./logs/xatiiBot.log`（全量）和 `./logs/xatiiBot-error.log`（只 WARN/ERROR）。
 
    之后再启动是**幂等**的：只补缺的表、缺的列，**不碰已有数据**。
