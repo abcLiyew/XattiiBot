@@ -379,13 +379,43 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
                 // 库里 live_status 可能是 NULL（历史数据 / 手工插入），同样不能直接拆箱
                 int savedStatus = pushInfo.getLiveStatus() == null ? 0 : pushInfo.getLiveStatus();
 
-                // —— 轮播中（既非未开播 0 也非直播中 1）——
-                // 语义：我们认为他在播（savedStatus=1），服务端说其实在轮播 ⇒ 推一条「下播」。
-                if (!currentLiveStatus.equals(1) && !currentLiveStatus.equals(0)) {
-                    if (savedStatus == 0) {
+                // ★★ 通知判据 = 「在播 / 不在播」这个**二值语义**的翻转，而不是原值本身。
+                //
+                //   B 站 live_status 有三种取值：0 未开播 / 1 直播中 / 2 轮播中，
+                //   而主播下播后房间**通常直接进 2（轮播）**并长时间停在 2。
+                //
+                //   🔴 2026-10-07 修的线上 bug（"下播的时候会发好多消息"）：
+                //   ① 判据原来是"原值变了就发一条"，而轮播分支的守卫写成了 `savedStatus == 0` ——
+                //      正确的守卫是"**我们之前认为他在播**"= `savedStatus == 1`。10-02 那次把
+                //      "0↔1 翻转"改成"写回服务端真实值"之后，轮播房间的库值变成 2 ⇒ 守卫永远
+                //      不成立 ⇒ 房间一进轮播就**每 10 秒推一条「下播了」，永不停止**
+                //      （真机三个订阅房间当时全是 live_status=2，等于常驻刷屏）。
+                //   ② `buildMessage` 当时用库里的原值反推"开播/下播"，于是「轮播 → 直播」
+                //      会被判成「下播」，新的一场永远等不到开播通知。
+                boolean nowLive = currentLiveStatus == 1;
+                boolean wasLive = savedStatus == 1;
+
+                // 场次标识：开播时服务端给真实开播时刻（本方法存进 live_time），
+                // 轮播 / 未开播恒为 "0000-00-00 00:00:00"（被解析成 null）。
+                // 用它区分「新的一场」与「同一场的重复观测 / 抖动」，
+                // 从而保证 **一场直播最多一条「开播」+ 最多一条「下播」**。
+                Long sessionStart = parseLiveStartMillis(room.getLive_time());
+
+                if (nowLive) {
+                    if (wasLive) {
+                        // 一直在播：同一场不会有第二条「开播」
                         continue;
                     }
-                    String message = buildMessage(bot, pushInfo, room, cardInfo, live);
+                    if (sessionStart != null && sessionStart.equals(pushInfo.getLiveTime())) {
+                        // 本场（开播于 sessionStart）已经处理过 —— 要么「开播」已发，
+                        // 要么「下播」已发而服务端又报直播中（轮播接手的抖动）。
+                        // ⚠️ 这里**刻意不回写 live_status=1**：一旦回写，下一轮服务端再报
+                        //   不在播时 wasLive 又为真，就会再发一条「下播」—— 抖动被重新放大。
+                        log.info("直播推送：roomId={} 本场（开播于 {}）已处理过，服务端又报直播中，按抖动忽略",
+                                roomId, sessionStart);
+                        continue;
+                    }
+                    String message = buildMessage(bot, pushInfo, room, cardInfo, live, true);
                     // 先把状态写库（占位），再发消息 —— 缩短"读到旧状态"的窗口，见 updatePushInfoStatus
                     updatePushInfoStatus(pushInfo, currentLiveStatus);
                     if (firstForTarget(sentTargets, pushInfo)) {
@@ -395,12 +425,20 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
                     continue;
                 }
 
-                // 只有直播状态真的发生变化时才处理
-                if (Objects.equals(currentLiveStatus, savedStatus)) {
+                // —— 不在播（0 未开播 / 2 轮播中 / 其它）——
+                if (!wasLive) {
+                    // 本来就不在播：0↔2（轮播起停）怎么动都不该发消息，
+                    // 只把原值对齐一下便于排查，绝不推送。
+                    if (!Objects.equals(currentLiveStatus, savedStatus)) {
+                        updatePushInfoStatus(pushInfo, currentLiveStatus);
+                    }
                     continue;
                 }
 
-                String sendMsg = buildMessage(bot, pushInfo, room, cardInfo, live);
+                // 在播 → 不在播：**整场只发这一条「下播」**。
+                // ⚠️ live_time 保持本场开播时刻不动（它是场次标识，见上），
+                //    所以服务端随后再抖回 1 会被上面的场次判断挡住，不会重复推送。
+                String sendMsg = buildMessage(bot, pushInfo, room, cardInfo, live, false);
                 // ★ 顺序是「构建 → 写库 → 发送」，与原实现一致，但写库改用按字段更新。
                 //   先占位写库是关键：否则"读到旧状态"到"写回新状态"之间的窗口 = 1 次
                 //   直播间请求 + 1 次名片请求，慢一点就会让下一轮看到旧状态而重推。
@@ -1215,60 +1253,84 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
      * 门面的每个 getter 都是一次真实 HTTP（见 {@link #livePush} 的注释），
      * 用门面写这条消息要打 6 次接口。
      *
-     * <p>⚠️ 本方法依赖 {@code pushInfo.getLiveStatus()} <b>翻转之前</b>的值来决定是
-     * 「开播」还是「下播」消息，所以调用点必须排在 {@link #updatePushInfoStatus} 前面。
+     * <p>⚠️ 该发「开播」还是「下播」<b>由调用方判定后显式传入</b>（{@code liveStarted}），
+     * 不再由本方法自己从 {@code pushInfo.getLiveStatus()} 反推 —— 库里那个值是服务端原值，
+     * 可能是 2（轮播中），而"轮播中的下一条状态"既可能是开播也可能是下播，
+     * 靠原值反推会把「轮播 → 直播」判成下播（2026-10-07 修的）。
      *
-     * @param bot       机器人
-     * @param pushInfo  订阅
-     * @param room      已取回的直播间信息（本轮缓存）
-     * @param cardInfo  名片门面（自带单槽缓存，复用同一实例可省掉重复请求）
-     * @param live      直播门面，仅用于 {@link Live#getLiveUrl(Long)}（纯本地拼接，不发请求）
+     * @param bot         机器人
+     * @param pushInfo    订阅
+     * @param room        已取回的直播间信息（本轮缓存）
+     * @param cardInfo    名片门面（自带单槽缓存，复用同一实例可省掉重复请求）
+     * @param live        直播门面，仅用于 {@link Live#getLiveUrl(Long)}（纯本地拼接，不发请求）
+     * @param liveStarted {@code true} = 发开播消息；{@code false} = 发下播消息
      */
-    private String buildMessage(Bot bot, PushInfo pushInfo, LiveRoom room, CardInfo cardInfo, Live live) throws IOException {
+    private String buildMessage(Bot bot, PushInfo pushInfo, LiveRoom room, CardInfo cardInfo, Live live,
+                                boolean liveStarted) throws IOException {
         List<Long> atListStr = pushInfo.getAtList();
         Long roomId = pushInfo.getRoomId();
         Long uid = room.getUid();
         String userName = cardInfo.getUserName(uid);
         String liveUrl = live.getLiveUrl(roomId);
 
-        // 开播消息
-        if (pushInfo.getLiveStatus() == null || pushInfo.getLiveStatus().equals(0)) {
-            // 处理开播时间
-            processLiveStartTime(pushInfo, room);
-
-            // 根据不同情况构建开播消息
-            Integer atAll = pushInfo.getAtAll();
-            if (atAll != null && atAll.equals(1) && isGroupAdmin(bot, pushInfo.getGroupId())) {
-                return buildAtAllLiveMessage(userName, room, liveUrl);
-            } else if (atListStr != null && !atListStr.isEmpty() && !atListStr.get(0).equals(0L)) {
-                return buildAtUserLiveMessage(atListStr, userName, room, liveUrl);
-            } else {
-                return buildNormalLiveMessage(userName, room, liveUrl);
-            }
-        }
         // 下播消息
-        else {
+        if (!liveStarted) {
             return buildLiveEndMessage(pushInfo, userName);
+        }
+
+        // 开播消息：先记下本场开播时刻（下播时长、场次去重都靠它）
+        processLiveStartTime(pushInfo, room);
+
+        Integer atAll = pushInfo.getAtAll();
+        if (atAll != null && atAll.equals(1) && isGroupAdmin(bot, pushInfo.getGroupId())) {
+            return buildAtAllLiveMessage(userName, room, liveUrl);
+        } else if (atListStr != null && !atListStr.isEmpty() && !atListStr.get(0).equals(0L)) {
+            return buildAtUserLiveMessage(atListStr, userName, room, liveUrl);
+        } else {
+            return buildNormalLiveMessage(userName, room, liveUrl);
         }
     }
 
     /**
-     * 处理直播开始时间。
-     *
-     * <p>{@code live_time} 在未开播时服务端会给 {@code "0000-00-00 00:00:00"}，
-     * 也可能给 null/空串 —— 后两者直接跳过，不要让它抛出来把整条推送带走。
+     * 处理直播开始时间（写入 {@code push_info.live_time}）。
      */
     private void processLiveStartTime(PushInfo pushInfo, LiveRoom room) {
-        String liveTimeText = room.getLive_time();
-        if (liveTimeText == null || liveTimeText.isBlank()) {
-            return;
+        Long startMillis = parseLiveStartMillis(room.getLive_time());
+        if (startMillis != null) {
+            pushInfo.setLiveTime(startMillis);
+        }
+    }
+
+    /**
+     * 解析服务端给的 {@code live_time}，拿不到有效场次就返回 {@code null}。
+     *
+     * <p>🔴 <b>{@code "0000-00-00 00:00:00"} 是非空字符串，但它不是时间</b>：
+     * 未开播 / 轮播中服务端给的就是它，而 {@code SimpleDateFormat} 默认 lenient，
+     * 会把它<b>成功</b>解析成一个公元前后的时间戳 —— 于是下播时长算出
+     * "1xxxxxxxx时"这种离谱值，场次去重也会被这个假值污染。
+     * 所以"零值日期"、解析失败、以及解析出非正数的一律当"没有场次"。
+     *
+     * @param liveTimeText 服务端 {@code live_time} 原文
+     * @return 开播时刻（epoch 毫秒）；{@code null} = 没有有效场次
+     */
+    private static Long parseLiveStartMillis(String liveTimeText) {
+        if (liveTimeText == null) {
+            return null;
+        }
+        String text = liveTimeText.trim();
+        if (text.isEmpty() || text.startsWith("0000")) {
+            return null;
         }
         try {
-            SimpleDateFormat formatter = SAFE_DATE_FORMAT.get();
-            Date liveTime = formatter.parse(liveTimeText);
-            pushInfo.setLiveTime(liveTime.getTime());
+            Date liveTime = SAFE_DATE_FORMAT.get().parse(text);
+            if (liveTime == null) {
+                return null;
+            }
+            long millis = liveTime.getTime();
+            return millis > 0 ? millis : null;
         } catch (ParseException e) {
-            log.error("解析开播时间失败", e);
+            log.error("解析开播时间失败: {}", liveTimeText, e);
+            return null;
         }
     }
 

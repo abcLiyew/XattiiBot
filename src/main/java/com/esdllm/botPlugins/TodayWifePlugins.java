@@ -19,15 +19,35 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * 今日老婆插件
  * <p>
- * 群友发送关键词「今日老婆」，随机抽取群内另一位成员作为其今日老婆，
+ * 群友发送关键词「今日老婆」，抽取群内另一位成员作为其今日老婆，
  * 并以 base64 图片的形式发送该成员头像。
+ *
+ * <p><b>抽签规则（2026-10-07 改）</b>：从「每人一次机会的均匀随机」改成
+ * <b>按群轮转发牌（无放回）</b>——
+ * <ol>
+ *   <li><b>一轮内每个人恰好被抽到一次</b>：不会再出现"人多的群里总是那几个人
+ *       被抽到、新人/潜水党永远抽不到"（均匀随机下这不是 bug 而是必然，
+ *       只是观感上像"有人被漏掉了"）。</li>
+ *   <li><b>一轮走完才重洗</b>，且<b>新一轮的第一次不抽上一轮最后那位</b>
+ *       ⇒ 跨轮"紧接着又抽到同一个人"也被挡掉，重复率降到最低。</li>
+ *   <li>候选集每次现取，所以<b>新入群的人立刻进池、退群的人自动出池</b>，
+ *       不需要额外的成员变更监听。</li>
+ * </ol>
+ *
+ * <p>⚠️ 轮转状态是<b>进程内内存</b>的（不落库）：重启后从新的一轮开始。
+ * 代价只是"重启后可能重复抽到"，换来的是零 DDL、零配置项 ——
+ * 与 {@code pushedDynamicIds} 那种"必须落库否则功能坏了"的情形不同，这里不值得。
  */
 @Slf4j
 @Shiro
@@ -43,6 +63,23 @@ public class TodayWifePlugins {
      * 头像下载超时时间，单位毫秒
      */
     private static final int TIMEOUT_MILLIS = 5000;
+
+    /**
+     * 每个群的轮转状态。
+     *
+     * <p>键是群号；条目只有在群真的用过这个功能后才会出现（自然按群懒加载）。
+     */
+    private final Map<Long, GroupRotation> rotations = new ConcurrentHashMap<>();
+
+    /**
+     * 一个群的「发牌」状态：本轮已抽过谁 + 上一次抽中的是谁。
+     */
+    private static final class GroupRotation {
+        /** 本轮已经被抽到过的人（一轮走完会被清空） */
+        private final Set<Long> servedThisRound = new HashSet<>();
+        /** 上一次抽中的人，仅用于"新一轮第一抽避开他" */
+        private Long lastDrawn;
+    }
 
     @Async
     @AnyMessageHandler
@@ -67,8 +104,77 @@ public class TodayWifePlugins {
             return;
         }
 
-        GroupMemberInfoResp wife = candidates.get(ThreadLocalRandom.current().nextInt(candidates.size()));
+        GroupMemberInfoResp wife = pickWife(groupId, candidates);
         bot.sendMsg(event, buildWifeMsg(qqUid, wife), false);
+    }
+
+    /**
+     * 从候选成员里抽一位「老婆」，按<b>群轮转</b>保证公平。
+     *
+     * <p>算法（一轮 = 群里每个人恰好一次）：
+     * <ol>
+     *   <li>把已经退群的人从本轮记录里剔掉（否则本轮永远走不完）；</li>
+     *   <li>本轮记录已覆盖当前全部候选 ⇒ 说明一轮走完了，清空重洗；</li>
+     *   <li>在「本轮还没被抽到过」的人里均匀随机取一个；</li>
+     *   <li>若这次是<b>新一轮的第一次</b>，先把上一轮的收尾那位排除在本次抽取之外
+     *       （他仍留在本轮的池子里，只是不第一个再出现）—— 这一条专门用来压低
+     *       "连续两次同一个人"的观感。</li>
+     * </ol>
+     *
+     * @param groupId    群号（轮转状态的键）
+     * @param candidates 候选成员（已排除发起人与机器人）
+     * @return 抽中的成员
+     */
+    private GroupMemberInfoResp pickWife(Long groupId, List<GroupMemberInfoResp> candidates) {
+        GroupRotation rotation = rotations.computeIfAbsent(groupId, k -> new GroupRotation());
+        synchronized (rotation) {
+            // 1) 退群的人不再占着"本轮名额"
+            if (!rotation.servedThisRound.isEmpty()) {
+                Set<Long> alive = new HashSet<>(candidates.size() * 2);
+                for (GroupMemberInfoResp member : candidates) {
+                    alive.add(member.getUserId());
+                }
+                rotation.servedThisRound.retainAll(alive);
+            }
+
+            // 2) 本轮的人已经走完 ⇒ 新的一轮
+            if (rotation.servedThisRound.size() >= candidates.size()) {
+                rotation.servedThisRound.clear();
+            }
+
+            // 3) 本轮还没被抽到过的人
+            List<GroupMemberInfoResp> remaining = new ArrayList<>(candidates.size());
+            for (GroupMemberInfoResp member : candidates) {
+                if (!rotation.servedThisRound.contains(member.getUserId())) {
+                    remaining.add(member);
+                }
+            }
+            // 兜底：理论上不会为空（上面刚清过），真为空也不让功能挂掉
+            if (remaining.isEmpty()) {
+                remaining = new ArrayList<>(candidates);
+                rotation.servedThisRound.clear();
+            }
+
+            // 4) 新一轮的第一抽：先把上一轮最后那位挪出"这一次"的选择范围
+            if (rotation.servedThisRound.isEmpty() && remaining.size() > 1
+                    && !Objects.isNull(rotation.lastDrawn)) {
+                List<GroupMemberInfoResp> withoutLast = new ArrayList<>(remaining.size());
+                for (GroupMemberInfoResp member : remaining) {
+                    if (!rotation.lastDrawn.equals(member.getUserId())) {
+                        withoutLast.add(member);
+                    }
+                }
+                // withoutLast 必然非空（remaining.size() > 1 时才进来）
+                if (!withoutLast.isEmpty()) {
+                    remaining = withoutLast;
+                }
+            }
+
+            GroupMemberInfoResp wife = remaining.get(ThreadLocalRandom.current().nextInt(remaining.size()));
+            rotation.servedThisRound.add(wife.getUserId());
+            rotation.lastDrawn = wife.getUserId();
+            return wife;
+        }
     }
 
     /**
