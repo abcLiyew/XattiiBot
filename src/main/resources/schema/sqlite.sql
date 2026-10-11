@@ -68,6 +68,12 @@ CREATE TABLE IF NOT EXISTS push_info (
   room_id       INTEGER NOT NULL,
   group_id      INTEGER,
   qq_uid        INTEGER,
+  -- 主播昵称。添加订阅时 pushAdd 本来就要问 B 站一次（拿它回"已订阅 xx"），
+  -- 顺手存下来，供「开播@全体 / 开播@我 不带房间号」时列房间用。
+  -- 老数据这列是空的，由 PushInfoServiceImpl#listRoomOptions 在列房间时按需回填。
+  -- ⚠️ 本行不能加行尾注释：DbInitializer#parseExpectedColumns 是行级解析，会把行尾注释
+  --    当成列定义的一部分拼进 ALTER TABLE ADD COLUMN，导致语法错误。
+  uname         TEXT,
   at_all        INTEGER DEFAULT (0) NOT NULL,
   at_list       ANY(1024),
   live_status   INTEGER DEFAULT (0) NOT NULL,

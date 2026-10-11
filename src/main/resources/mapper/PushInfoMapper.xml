@@ -9,6 +9,7 @@
             <result property="roomId" column="room_id" />
             <result property="groupId" column="group_id" />
             <result property="qqUid" column="qq_uid" />
+            <result property="uname" column="uname" />
             <result property="atAll" column="at_all" />
             <result property="atList" column="at_list" typeHandler="com.esdllm.config.LongListTypeHandler" />
             <result property="liveStatus" column="live_status" />
@@ -21,7 +22,7 @@
     </resultMap>
 
     <sql id="Base_Column_List">
-        pid,room_id,group_id,qq_uid,at_all,at_list,
+        pid,room_id,group_id,qq_uid,uname,at_all,at_list,
         live_status,live_time,live_push,dynamic_push,create_time,
         update_time,is_delete
     </sql>

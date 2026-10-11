@@ -40,6 +40,15 @@ public class PushInfo {
     private Long qqUid;
 
     /**
+     * 主播昵称。
+     *
+     * <p>添加订阅时 {@code PushInfoServiceImpl#pushAdd} 本来就要问 B 站一次（拿它回"已订阅 xx"），
+     * 顺手存下来，供「开播@全体 / 开播@我 不带房间号」时列出房间用。
+     * 老数据为空 —— 列房间时按需回填一次（见 {@code listRoomOptions}）。
+     */
+    private String uname;
+
+    /**
      * 是否at全体 0-否  1-是 默认0
      */
     private Integer atAll = 0;
@@ -101,6 +110,7 @@ public class PushInfo {
             && (this.getRoomId() == null ? other.getRoomId() == null : this.getRoomId().equals(other.getRoomId()))
             && (this.getGroupId() == null ? other.getGroupId() == null : this.getGroupId().equals(other.getGroupId()))
             && (this.getQqUid() == null ? other.getQqUid() == null : this.getQqUid().equals(other.getQqUid()))
+            && (this.getUname() == null ? other.getUname() == null : this.getUname().equals(other.getUname()))
             && (this.getAtAll() == null ? other.getAtAll() == null : this.getAtAll().equals(other.getAtAll()))
             && (this.getAtList() == null ? other.getAtList() == null : this.getAtList().equals(other.getAtList()))
             && (this.getLiveStatus() == null ? other.getLiveStatus() == null : this.getLiveStatus().equals(other.getLiveStatus()))
@@ -120,6 +130,7 @@ public class PushInfo {
         result = prime * result + ((getRoomId() == null) ? 0 : getRoomId().hashCode());
         result = prime * result + ((getGroupId() == null) ? 0 : getGroupId().hashCode());
         result = prime * result + ((getQqUid() == null) ? 0 : getQqUid().hashCode());
+        result = prime * result + ((getUname() == null) ? 0 : getUname().hashCode());
         result = prime * result + ((getAtAll() == null) ? 0 : getAtAll().hashCode());
         result = prime * result + ((getAtList() == null) ? 0 : getAtList().hashCode());
         result = prime * result + ((getLiveStatus() == null) ? 0 : getLiveStatus().hashCode());
@@ -134,24 +145,23 @@ public class PushInfo {
 
     @Override
     public String toString() {
-        StringBuilder sb = new StringBuilder();
-        sb.append(getClass().getSimpleName());
-        sb.append(" [");
-        sb.append("Hash = ").append(hashCode());
-        sb.append(", pid=").append(pid);
-        sb.append(", roomId=").append(roomId);
-        sb.append(", groupId=").append(groupId);
-        sb.append(", qqUid=").append(qqUid);
-        sb.append(", atAll=").append(atAll);
-        sb.append(", atList=").append(atList);
-        sb.append(", liveStatus=").append(liveStatus);
-        sb.append(", liveTime=").append(liveTime);
-        sb.append(", livePush=").append(livePush);
-        sb.append(", dynamicPush=").append(dynamicPush);
-        sb.append(", createTime=").append(createTime);
-        sb.append(", updateTime=").append(updateTime);
-        sb.append(", isDelete=").append(isDelete);
-        sb.append("]");
-        return sb.toString();
+        return getClass().getSimpleName() +
+                " [" +
+                "Hash = " + hashCode() +
+                ", pid=" + pid +
+                ", roomId=" + roomId +
+                ", groupId=" + groupId +
+                ", qqUid=" + qqUid +
+                ", uname=" + uname +
+                ", atAll=" + atAll +
+                ", atList=" + atList +
+                ", liveStatus=" + liveStatus +
+                ", liveTime=" + liveTime +
+                ", livePush=" + livePush +
+                ", dynamicPush=" + dynamicPush +
+                ", createTime=" + createTime +
+                ", updateTime=" + updateTime +
+                ", isDelete=" + isDelete +
+                "]";
     }
 }

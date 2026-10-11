@@ -269,7 +269,7 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
         int livePushStatus = pushSettings[0];
         int dynamicPushStatus = pushSettings[1];
 
-        PushInfo pushInfo = createPushInfo(roomId, event.getUserId(), event.getGroupId(), livePushStatus, dynamicPushStatus);
+        PushInfo pushInfo = createPushInfo(roomId, event.getUserId(), event.getGroupId(), livePushStatus, dynamicPushStatus, userName);
         boolean save = this.save(pushInfo);
 
         if (save) {
@@ -318,6 +318,183 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
             }
         } catch (Exception e) {
             throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * 开播 @全体 的开关（群级，作用于该群该房间的全部订阅记录）。
+     *
+     * <p>先用 {@code selectCount} 判"本群到底订没订这个房间"，再更新 —— 而不是拿
+     * {@code update} 的返回行数当判据：<b>MySQL 默认返回"实际改变的行数"</b>，
+     * 值本来就等于目标值时返回 0，会被误判成"没有订阅"（虽然当前主库是 SQLite，
+     * 但这条 SQL 不该依赖某个驱动的 affected-rows 语义）。
+     */
+    @Override
+    public boolean setLivePushAtAll(Long groupId, Long roomId, boolean on) {
+        if (Objects.isNull(groupId) || Objects.isNull(roomId)) {
+            return false;
+        }
+        Long count = pushInfoMapper.selectCount(new LambdaQueryWrapper<PushInfo>()
+                .eq(PushInfo::getGroupId, groupId)
+                .eq(PushInfo::getRoomId, roomId));
+        if (count == null || count == 0) {
+            return false;
+        }
+        pushInfoMapper.update(null, new LambdaUpdateWrapper<PushInfo>()
+                .eq(PushInfo::getGroupId, groupId)
+                .eq(PushInfo::getRoomId, roomId)
+                .set(PushInfo::getAtAll, on ? 1 : 0)
+                .set(PushInfo::getUpdateTime, System.currentTimeMillis()));
+        return true;
+    }
+
+    /**
+     * 「开播@我」的开/关：把某个 QQ 加进 / 移出该群该房间订阅的 {@code at_list}。
+     *
+     * <p><b>为什么要逐条读-改-写</b>：{@code at_list} 是个集合（存成 {@code '[1, 2, 3]'}
+     * 文本），既不能靠一条 UPDATE 加减，也不能整行覆盖（{@code updateById} 会把这一轮
+     * 读到的 {@code live_status}/{@code live_time} 快照一起写回去，和 10 秒一轮的
+     * {@code livePush} 抢同一行）。所以只 set 这一列。
+     *
+     * <p>{@code 0} 是"没有任何 @ 目标"的占位值（模型默认 {@code List.of(0L)}，发送侧判
+     * {@code atList.get(0) != 0} 才走 @某人 分支），清空后要补回去，避免留下空列表
+     * 让发送侧走 {@code get(0)} 时越界。
+     */
+    @Override
+    public boolean setLivePushAtMe(Long groupId, Long roomId, Long qq, boolean on) {
+        if (Objects.isNull(groupId) || Objects.isNull(roomId) || Objects.isNull(qq)) {
+            return false;
+        }
+        List<PushInfo> list = this.list(new LambdaQueryWrapper<PushInfo>()
+                .eq(PushInfo::getGroupId, groupId)
+                .eq(PushInfo::getRoomId, roomId));
+        if (list.isEmpty()) {
+            return false;
+        }
+        for (PushInfo info : list) {
+            // ⚠️ 必须复制成可变列表：模型默认值是 List.of(0L)（不可变），直接 add 会抛
+            //    UnsupportedOperationException。typeHandler 读回来的是 ArrayList，但两处都可能是它。
+            List<Long> at = info.getAtList() == null
+                    ? new ArrayList<>() : new ArrayList<>(info.getAtList());
+            // 先去掉占位 0 与本人既有的记录（保证重复设置不会越加越多），再按需加回
+            at.removeIf(v -> v == null || v == 0L || v.equals(qq));
+            if (on) {
+                at.add(qq);
+            }
+            if (at.isEmpty()) {
+                at.add(0L);
+            }
+            pushInfoMapper.update(null, new LambdaUpdateWrapper<PushInfo>()
+                    .eq(PushInfo::getPid, info.getPid())
+                    .set(PushInfo::getAtList, at)
+                    .set(PushInfo::getUpdateTime, System.currentTimeMillis()));
+        }
+        return true;
+    }
+
+    /**
+     * 本群订阅了哪些房间（按 roomId 聚合、升序），附带主播昵称与 @ 设置摘要。
+     *
+     * <p>为什么必须聚合：{@code push_info} 的去重维度是 房间 + QQ + 群，同一房间被
+     * 三个人各加过一次就有三行 —— 直接按行返回会把"本群订了 1 个房间"报成"订了 3 个"，
+     * 而用户说的"订了几个"指的是<b>房间</b>。
+     *
+     * <p><b>副作用说明</b>：老数据（加 {@code uname} 列之前订阅的）没有主播名，这里会
+     * 顺手问 B 站补一次并回写。之所以敢在这个"读"方法里发网络请求：它只在用户主动发
+     * 「开播@全体 / 开播@我 不带房间号」时被调用，是<b>低频人工操作</b>，且补过一次就落库了
+     * （下次直接读库，零请求）。补查有次数上限与间隔，见 {@link #lookupUname}。
+     */
+    @Override
+    public List<RoomAtOption> listRoomOptions(Long groupId) {
+        if (Objects.isNull(groupId)) {
+            return List.of();
+        }
+        List<PushInfo> list = this.list(new LambdaQueryWrapper<PushInfo>()
+                .eq(PushInfo::getGroupId, groupId));
+
+        // 保持插入顺序，最后再按房间号排序（LinkedHashMap 只是为了让"同一房间的记录"聚在一起）
+        Map<Long, List<PushInfo>> byRoom = new LinkedHashMap<>();
+        for (PushInfo info : list) {
+            if (Objects.isNull(info.getRoomId())) {
+                continue;
+            }
+            byRoom.computeIfAbsent(info.getRoomId(), k -> new ArrayList<>()).add(info);
+        }
+
+        List<RoomAtOption> out = new ArrayList<>(byRoom.size());
+        for (Map.Entry<Long, List<PushInfo>> e : byRoom.entrySet()) {
+            boolean atAll = false;
+            // 用 LinkedHashSet：多行之间的 at_list 要去重（同一个人可能被不同行记过）
+            Set<Long> atMe = new LinkedHashSet<>();
+            String uname = null;
+            for (PushInfo info : e.getValue()) {
+                if (Integer.valueOf(1).equals(info.getAtAll())) {
+                    atAll = true;
+                }
+                if (info.getAtList() != null) {
+                    for (Long q : info.getAtList()) {
+                        if (q != null && q != 0L) {
+                            atMe.add(q);
+                        }
+                    }
+                }
+                if (uname == null && info.getUname() != null && !info.getUname().isBlank()) {
+                    uname = info.getUname();
+                }
+            }
+            out.add(new RoomAtOption(e.getKey(), uname, atAll, new ArrayList<>(atMe)));
+        }
+        out.sort(Comparator.comparing(RoomAtOption::roomId));
+
+        // 老数据补名字：record 不可变，所以按索引整体替换；命中后回写该群该房间的全部记录。
+        int filled = 0;
+        for (int i = 0; i < out.size() && filled < MAX_NAME_LOOKUP_PER_CALL; i++) {
+            RoomAtOption opt = out.get(i);
+            if (opt.uname() != null && !opt.uname().isBlank()) {
+                continue;
+            }
+            String name = lookupUname(opt.roomId());
+            if (name == null || name.isBlank()) {
+                continue;
+            }
+            filled++;
+            out.set(i, new RoomAtOption(opt.roomId(), name, opt.atAll(), opt.atMe()));
+            pushInfoMapper.update(null, new LambdaUpdateWrapper<PushInfo>()
+                    .eq(PushInfo::getGroupId, groupId)
+                    .eq(PushInfo::getRoomId, opt.roomId())
+                    .set(PushInfo::getUname, name));
+        }
+        return out;
+    }
+
+    /** 一次「列房间」最多补查几个房间的名字（防呆：订阅特别多时不至于让命令卡很久）。 */
+    private static final int MAX_NAME_LOOKUP_PER_CALL = 5;
+
+    /**
+     * 问 B 站要一次「房间号 → 主播昵称」（两个请求：房间 → uid，uid → 昵称）。
+     *
+     * <p>只在 {@link #listRoomOptions} 发现老数据缺名时调用：
+     * <ul>
+     *   <li>两次请求之间睡 300ms —— B 站的 412 是"请求密度"敏感型（实测 1 秒内 3 个请求即触发），
+     *       而这个方法可能被连着调好几次；</li>
+     *   <li>失败一律静默返回 {@code null}：列房间是给人挑房间用的，拿不到名字不该让整条命令失败。</li>
+     * </ul>
+     */
+    private String lookupUname(Long roomId) {
+        try {
+            Long uid = new Live().getUid(roomId);
+            if (uid == null) {
+                return null;
+            }
+            Thread.sleep(300);
+            String name = new CardInfo().getUserName(uid);
+            return name == null || name.isBlank() ? null : name;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        } catch (Exception e) {
+            log.warn("补查房间 {} 的主播昵称失败（不影响列房间）", roomId, e);
+            return null;
         }
     }
 
@@ -1493,11 +1670,19 @@ public class PushInfoServiceImpl extends ServiceImpl<PushInfoMapper, PushInfo>
         return new int[]{livePushStatus, dynamicPushStatus};
     }
 
-    private PushInfo createPushInfo(Long roomId, Long qqUid, Long groupId, int livePushStatus, int dynamicPushStatus) {
+    /**
+     * 组装一条订阅记录。
+     *
+     * @param uname 主播昵称 —— 顺手存下来（{@code pushAdd} 为回"已订阅 xx"本来就要问 B 站一次，
+     *              白查），供「开播@全体 / 开播@我 不带房间号」时列房间用
+     */
+    private PushInfo createPushInfo(Long roomId, Long qqUid, Long groupId, int livePushStatus, int dynamicPushStatus,
+                                    String uname) {
         PushInfo pushInfo = new PushInfo();
         pushInfo.setRoomId(roomId);
         pushInfo.setQqUid(qqUid);
         pushInfo.setGroupId(groupId);
+        pushInfo.setUname(uname);
         pushInfo.setLivePush(livePushStatus);
         pushInfo.setDynamicPush(dynamicPushStatus);
         pushInfo.setCreateTime(System.currentTimeMillis());
