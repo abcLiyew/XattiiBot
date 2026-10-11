@@ -1,5 +1,6 @@
 package com.esdllm.botPlugins;
 
+import com.esdllm.common.CmdPrefix;
 import com.esdllm.config.LoadDSConfig;
 import com.esdllm.contant.BiliBiliContant;
 import com.esdllm.model.respObj.PushInfoResp;
@@ -25,6 +26,18 @@ import java.util.concurrent.atomic.AtomicBoolean;
 @Component
 @Shiro
 public class BiliBiliPushPlugins {
+
+    /**
+     * 命令的<b>可选前缀</b>：行首空白 / CQ 码（@机器人 等）/ <b>手打的 @机器人</b>。
+     *
+     * <p>取 {@link CmdPrefix#PREFIX}，与搜索 / cookie / 录播等命令<b>同一口径</b>：
+     * {@code 添加订阅 123}、{@code [CQ:at,qq=213481590] 添加订阅 123}、
+     * {@code @Hana 添加订阅 123} 都命中，而 {@code @张三 添加订阅 123} 不命中。
+     *
+     * <p>⚠️ 前缀只管"命令词之前"；命令词之后照旧是 {@code .*}（房间号 + 推送开关都在后面）。
+     */
+    private static final String CMD_PREFIX = CmdPrefix.PREFIX;
+
     @Resource
     private LoadDSConfig loadDSConfig;
     @Resource
@@ -41,7 +54,7 @@ public class BiliBiliPushPlugins {
      * @param event 收到的消息
      */
     @AnyMessageHandler
-    @MessageHandlerFilter(cmd = "^添加订阅.*", at = AtEnum.BOTH)
+    @MessageHandlerFilter(cmd = "^" + CMD_PREFIX + "添加订阅.*", at = AtEnum.BOTH)
     public void addPush(Bot bot, AnyMessageEvent event) {
         try {
             String message = parseMessage(event.getMessage());
@@ -83,7 +96,7 @@ public class BiliBiliPushPlugins {
      * @param event 信息
      */
     @AnyMessageHandler
-    @MessageHandlerFilter(cmd = "^取消订阅.*", at = AtEnum.BOTH)
+    @MessageHandlerFilter(cmd = "^" + CMD_PREFIX + "取消订阅.*", at = AtEnum.BOTH)
     public void delPush(Bot bot, AnyMessageEvent event) {
         try {
             String message = parseMessage(event.getMessage());
@@ -257,8 +270,24 @@ public class BiliBiliPushPlugins {
         sendMessage(bot, event, sendMsg);
     }
 
+    /**
+     * 取命令参数：剥掉 CQ 码（真 @ / 图片等）、<b>手打的 {@code @机器人}</b>、以及命令词本身。
+     *
+     * <p>⚠️ 手打的 {@code @Hana} 只是<b>普通文本</b>，不是 CQ 段，光剥 CQ 码剥不掉 ——
+     * 不剥的话 {@code @Hana 添加订阅 123} 会先变成 {@code @Hana 123}，
+     * {@code split(" ")[0]} 拿到 {@code @Hana}，直接回一句"格式错误"。
+     * 剥法见 {@link CmdPrefix#stripMention}（先按已知称呼精确剥，认不出再整段剥）。
+     */
     private String parseMessage(String message) {
-        return message.trim().replaceAll("\\[CQ:[^]]*]", "").trim().replace("添加订阅", "").trim().replace("取消订阅", "").trim();
+        if (message == null) {
+            return "";
+        }
+        String body = message.replaceAll("\\[CQ:[^]]*]", " ");
+        body = CmdPrefix.stripMention(body);
+        // replaceFirst 而不是 replace：命令词只该吃掉"最前面那一个"，
+        // 用 replace 会把正文里出现的同名字样也一并抹掉（提示词里带"添加订阅"就中招）
+        body = body.replaceFirst("(?isU)(?:添加订阅|取消订阅)", " ");
+        return body.strip();
     }
 
     private void sendErrorMessage(Bot bot, AnyMessageEvent event, String errorMessage) {

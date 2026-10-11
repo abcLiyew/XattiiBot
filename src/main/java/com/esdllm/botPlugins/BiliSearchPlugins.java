@@ -7,6 +7,7 @@ import com.esdllm.bilibiliApi.model.data.pojo.search.SearchTypeResult;
 import com.esdllm.bilibiliApi.model.data.pojo.search.SearchVideo;
 import com.esdllm.bilibiliApi.model.data.pojo.video.PopularList;
 import com.esdllm.bilibiliApi.model.data.pojo.video.VideoBrief;
+import com.esdllm.common.CmdPrefix;
 import com.esdllm.common.NumFormat;
 import com.esdllm.contant.BiliBiliContant;
 import com.mikuac.shiro.annotation.AnyMessageHandler;
@@ -33,6 +34,12 @@ import java.util.concurrent.ConcurrentHashMap;
  * 今日热门           ← 全站综合热度 Top5
  * </pre>
  *
+ * <p>命令前的 <b>@机器人 可写可不写</b>：真 @（QQ 的 @ 选人）、手打的 {@code @Hana}、
+ * 干脆不加 @ —— 三种写法都认，细节见 {@link CmdPrefix}。
+ * 但手打 @ <b>只认机器人自己的称呼</b>（账号昵称 / 各群群名片 / QQ 号，由
+ * {@code SelfNameRegistry} 从 OneBot 现拿，代码里不写死），
+ * {@code @张三 搜视频 xxx} 不会触发（那是群友互相 @，不该被插话）。
+ *
  * <p><b>为什么不做权限门</b>：三条命令都是<b>只读、匿名、无副作用</b> ——
  * 不改任何配置、不动订阅数据、不需要 Cookie（三个端点实测都不需要凭据），
  * 与"发个链接自动解析"是同一性质。给它们套管理员权限只会让群员问不出话，
@@ -51,18 +58,29 @@ import java.util.concurrent.ConcurrentHashMap;
 @Shiro
 public class BiliSearchPlugins {
 
-    /** 允许出现在前置的 CQ 码（@机器人 / 图片等），匹配时忽略 */
-    private static final String LEADING_CQ = "(\\[CQ:[^]]*\\]\\s*)*";
+    /**
+     * 命令的<b>可选前缀</b>：允许消息最前面出现 <b>行首空白</b> / <b>CQ 码</b>（@机器人 / 图片等）
+     * / <b>「手打的 @机器人」</b>。三种写法因此都能命中：
+     * <pre>
+     * 搜视频 影视飓风          ← 不加 @（最稳）
+     * [CQ:at,qq=213481590] 搜视频 影视飓风   ← 用 QQ 的 @ 选人（真 @）
+     * @Hana 搜视频 影视飓风     ← 手打/粘贴的 @机器人（不是真 @）
+     * </pre>
+     *
+     * <p>细节（shiro 为什么本来就能认真 @、为什么要大写 {@code U}、为什么只认机器人自己的称呼）
+     * 全部收口在 {@link CmdPrefix}，这里只做拼接；前缀<b>自带 flags</b>，外面不用再写 {@code (?isU)}。
+     */
+    private static final String CMD_PREFIX = CmdPrefix.PREFIX;
 
     /** `搜视频 xxx`（也接受「搜索视频」「视频搜索」） */
     private static final String CMD_SEARCH_VIDEO =
-            "(?is)^" + LEADING_CQ + "(?:搜视频|搜索视频|视频搜索).*";
+            "^" + CMD_PREFIX + "(?:搜视频|搜索视频|视频搜索).*";
     /** `热搜`（也接受「热搜榜」） */
     private static final String CMD_HOT_SEARCH =
-            "(?is)^" + LEADING_CQ + "(?:b站|B站)?(?:热搜榜|热搜)\\s*$";
-    /** `今日热门`（也接受「热门视频」「B站热门」） */
+            "^" + CMD_PREFIX + "(?:b站|B站)?(?:热搜榜|热搜)\\s*$";
+    /** `今日热门`（也接受「热门视频」「热门」） */
     private static final String CMD_POPULAR =
-            "(?is)^" + LEADING_CQ + "(?:b站|B站)?(?:今日热门|热门视频|热门)\\s*$";
+            "^" + CMD_PREFIX + "(?:b站|B站)?(?:今日热门|热门视频|热门)\\s*$";
 
     /** 搜索结果展示条数 */
     private static final int MAX_SEARCH_RESULT = 5;
@@ -251,15 +269,25 @@ public class BiliSearchPlugins {
     // ------------------------------------------------------------------ 工具
 
     /**
-     * 从消息里取关键词：剥掉 CQ 码与命令词，剩下的一整段（允许中间有空格）。
+     * 从消息里取关键词：剥掉 CQ 码、<b>手打的 @昵称</b>、命令词，剩下的一整段（允许中间有空格）。
+     *
+     * <p>⚠️ <b>手打的 @昵称必须一起剥</b>：它不属于关键词。真 @ 在 shiro 那层已经剥过了
+     * （见 {@link #CMD_PREFIX}），但字面文本剥不掉 —— 不处理的话
+     * {@code @Hana 搜视频 祖国万岁被删评} 会把 {@code @Hana} 当成关键词的一部分去搜，
+     * 用户看到的就是「搜「@Hana 祖国万岁被删评」没搜到」这种脏结果。
+     *
+     * <p>⚠️ 收尾用 {@link String#strip()} 而<b>不是</b> {@code trim()}：{@code trim()} 只剔
+     * {@code <= U+0020} 的字符，全角空格 U+3000 会漏进关键词（同 {@link CmdPrefix} 里
+     * 必须用大写 {@code U} 的理由）。匹配用的 {@code \s} 也都带 {@code (?sU)}。
      */
     private static String extractKeyword(String message) {
         if (message == null) {
             return "";
         }
         String body = message.replaceAll("\\[CQ:[^]]*]", " ");
-        body = body.replaceFirst("(?is)(?:搜视频|搜索视频|视频搜索)", " ");
-        return body.trim();
+        body = CmdPrefix.stripMention(body);
+        body = body.replaceFirst("(?isU)(?:搜视频|搜索视频|视频搜索)", " ");
+        return body.strip();
     }
 
     /**

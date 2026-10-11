@@ -2,6 +2,7 @@ package com.esdllm.botPlugins;
 
 import com.esdllm.bilibiliApi.http.HttpPolicy;
 import com.esdllm.common.BotAdminChecker;
+import com.esdllm.common.CmdPrefix;
 import com.esdllm.common.CookieUtils;
 import com.esdllm.config.LoadDSConfig;
 import com.esdllm.service.CredentialGuard;
@@ -84,21 +85,26 @@ import java.util.regex.Pattern;
 @Shiro
 public class BiliConfigPlugins {
 
-    /** 允许出现在前置的 CQ 码（@机器人 / 图片等），匹配时忽略 */
-    private static final String LEADING_CQ = "(\\[CQ:[^]]*\\]\\s*)*";
+    /**
+     * 命令的<b>可选前缀</b>：行首空白 / CQ 码（@机器人 / 图片等）/ <b>手打的 @机器人</b>。
+     *
+     * <p>直接取 {@link CmdPrefix#PREFIX}，与搜索 / 反刷屏 / 录播等命令<b>同一口径</b>；
+     * 前缀自带 flags，下面各条不用再写 {@code (?is)}（详见 {@link CmdPrefix}）。
+     */
+    private static final String CMD_PREFIX = CmdPrefix.PREFIX;
 
     /** 设置 Cookie：`设置cookie ...` / `配置cookie ...`（`. *` 配 DOTALL，允许换行粘贴） */
-    private static final String CMD_SET = "(?is)^" + LEADING_CQ + "(?:设置|配置)cookie.*";
+    private static final String CMD_SET = "^" + CMD_PREFIX + "(?:设置|配置)cookie.*";
     /** 查看 Cookie 状态 */
-    private static final String CMD_STATUS = "(?is)^" + LEADING_CQ + "(?:cookie状态|查看cookie|cookie查询).*";
+    private static final String CMD_STATUS = "^" + CMD_PREFIX + "(?:cookie状态|查看cookie|cookie查询).*";
     /** 清除 Cookie */
-    private static final String CMD_CLEAR = "(?is)^" + LEADING_CQ + "(?:清除|删除|清空)cookie.*";
+    private static final String CMD_CLEAR = "^" + CMD_PREFIX + "(?:清除|删除|清空)cookie.*";
     /** 设置代理 */
-    private static final String CMD_PROXY_SET = "(?is)^" + LEADING_CQ + "(?:设置|配置)代理.*";
+    private static final String CMD_PROXY_SET = "^" + CMD_PREFIX + "(?:设置|配置)代理.*";
     /** 查看代理状态 */
-    private static final String CMD_PROXY_STATUS = "(?is)^" + LEADING_CQ + "(?:代理状态|查看代理|代理查询).*";
+    private static final String CMD_PROXY_STATUS = "^" + CMD_PREFIX + "(?:代理状态|查看代理|代理查询).*";
     /** 清除代理 */
-    private static final String CMD_PROXY_CLEAR = "(?is)^" + LEADING_CQ + "(?:清除|删除|清空)代理.*";
+    private static final String CMD_PROXY_CLEAR = "^" + CMD_PREFIX + "(?:清除|删除|清空)代理.*";
     /**
      * 功能开关：<code>开关</code>（列出全部）/ <code>开关 热评 开</code>（修改一项）。
      *
@@ -107,7 +113,7 @@ public class BiliConfigPlugins {
      * "未知开关"。宁可漏判（用户补个空格即可），也不要误判别人的日常聊天。
      */
     private static final String CMD_SWITCH =
-            "(?is)^" + LEADING_CQ + "(?:功能)?开关(?:\\s.*|状态)?$";
+            "^" + CMD_PREFIX + "(?:功能)?开关(?:\\s.*|状态)?$";
 
     /** 分隔符：空白、分号（兼容 `a=1; b=2` 与 `key:value` 混排） */
     private static final Pattern TOKEN_SPLIT = Pattern.compile("[\\s;]+");
@@ -498,6 +504,17 @@ public class BiliConfigPlugins {
                 if (CLEAR_WORDS.contains(v.toLowerCase())) {
                     yield "";
                 }
+                if (option == Option.BOT_NAMES) {
+                    // 与 CmdPrefix 用同一份拆词/校验，免得"能填的"和"认得的"对不上
+                    List<String> names = CmdPrefix.splitNames(v);
+                    if (names.isEmpty()) {
+                        send(bot, event, "「" + option.label + "」要一串名字（逗号/空格分隔），"
+                                + "每个不超过 " + 32 + " 个字、不能含 @。\n"
+                                + "例：机器人,bot　｜　发「" + CLEAR_WORD_HINT + "」可清空\n收到：" + rawValue);
+                        yield null;
+                    }
+                    yield String.join(",", names);
+                }
                 if (!HTTP_URL.matcher(v).matches()) {
                     send(bot, event, "「" + option.label + "」要一个 http/https 地址："
                             + "https://rec.example.com 或 http://1.2.3.4:2233\n"
@@ -621,7 +638,8 @@ public class BiliConfigPlugins {
     private static List<String> parseSwitchArgs(String message) {
         String body = message.replaceAll("\\[CQ:[^]]*]", " ")
                 .replace('\u3000', ' ');
-        // 命令词本身可能有几种形态（开关 / 功能开关 / 开关状态），一并吃掉
+        // 先剥「手打的 @机器人」，命令词本身可能有几种形态（开关 / 功能开关 / 开关状态），一并吃掉
+        body = CmdPrefix.stripMention(body);
         body = body.replaceFirst("(?is)^\\s*(?:功能)?开关(?:状态)?", " ");
         List<String> tokens = new ArrayList<>();
         for (String token : TOKEN_SPLIT.split(body)) {
@@ -706,7 +724,20 @@ public class BiliConfigPlugins {
                 "「录播网页」发出去的链接用哪个地址开头",
                 "不配则按网卡自动推断；推断出来不是公网地址时不会发链接（只回一段提示让你配这项）"
                         + " ⇒ 机器人跑在内网/容器里时，这是必配项",
-                "网页基址", "基址", "网址", "baseurl", "weburl");
+                "网页基址", "基址", "网址", "baseurl", "weburl"),
+        /**
+         * 机器人自己的「叫法」—— 命令头 {@code @某人} 里哪个名字算"在叫机器人"。
+         *
+         * <p>账号昵称、各群群名片、QQ 号都<b>自动</b>从 OneBot 拿（{@code common/SelfNameRegistry}），
+         * 换号不用改任何东西；这里只补"跟账号无关的通用叫法"（群友习惯喊的「机器人」「bot」）。
+         * 默认<b>空</b>：代码里不写死任何名字，避免换个号就作废。
+         */
+        BOT_NAMES("称呼", Kind.TEXT, LoadDSConfig.KEY_BOT_NAME_ALIASES,
+                "命令前面 @ 哪个名字算在叫机器人（通用叫法，如「机器人」「bot」）",
+                "账号昵称 / 各群群名片 / 自身 QQ 号是自动从 OneBot 取的，不用在这里填；"
+                        + "这一项只补跟账号无关的叫法。⚠️ 填太短太常见的词（如「猫」）会让别人的 "
+                        + "@某人 误触；留空 = 只认 OneBot 给的名字",
+                "机器人称呼", "名字", "叫法", "alias", "name");
 
         private final String label;
         private final Kind kind;
@@ -748,7 +779,7 @@ public class BiliConfigPlugins {
             return switch (kind) {
                 case INT -> "12";
                 case SOURCE -> "follow";
-                case TEXT -> "https://rec.example.com";
+                case TEXT -> this == BOT_NAMES ? "机器人,bot" : "https://rec.example.com";
                 default -> "开";
             };
         }
@@ -764,7 +795,9 @@ public class BiliConfigPlugins {
                 case BOOL -> "按关处理";
                 case INT -> "默认 " + CredentialGuard.DEFAULT_CHECK_HOURS;
                 case SOURCE -> "按 auto 处理";
-                case TEXT -> this == RECORD_WEB_BASE ? "自动推断基址" : "不配该项";
+                case TEXT -> this == RECORD_WEB_BASE ? "自动推断基址"
+                        : this == BOT_NAMES ? "只认 OneBot 给的昵称 / 群名片 / QQ 号"
+                        : "不配该项";
             };
         }
 
@@ -789,6 +822,9 @@ public class BiliConfigPlugins {
                         "推荐：域名 + 反代。⚠️ 反代必须透传 Range 头，否则进度条和断点续传失效");
                 notes.put("http://1.2.3.4:2233", "公网 IP 直连：端口写 HTTP 服务真实监听的端口");
                 notes.put(CLEAR_WORD_HINT, "清空 ⇒ 回到按网卡自动推断（机器有公网网卡时才推得出来）");
+            } else if (this == BOT_NAMES) {
+                notes.put("机器人,bot", "逗号 / 空格 / 顿号分隔，可写多个；大小写与中间的空格都不敏感");
+                notes.put(CLEAR_WORD_HINT, "清空 ⇒ 只认 OneBot 给的昵称 / 群名片 / QQ 号（推荐）");
             }
             return notes;
         }
@@ -805,6 +841,8 @@ public class BiliConfigPlugins {
             return "";
         }
         String body = message.replaceAll("\\[CQ:[^]]*]", " ");
+        // 先剥「手打的 @机器人」，否则 @Hana 会被当成"地址"返回给调用方
+        body = CmdPrefix.stripMention(body);
         body = body.replaceFirst("(?is)(?:设置|配置|清除|删除|清空|查看|查询)?代理(?:状态|查询)?", " ");
         for (String token : TOKEN_SPLIT.split(body)) {
             String t = token.trim().replaceAll("^[\"'<>,]+", "").replaceAll("[\"'<>,]+$", "");
@@ -827,7 +865,8 @@ public class BiliConfigPlugins {
         String body = message.replaceAll("\\[CQ:[^]]*]", " ");
         // 中文输入法很容易打出全角冒号，先归一化，否则会被误判成"格式不对"
         body = body.replace('：', ':');
-        // 去掉命令词本身
+        // 去掉「手打的 @机器人」与命令词本身
+        body = CmdPrefix.stripMention(body);
         body = body.replaceFirst("(?is)(?:设置|配置)cookie", " ");
         body = body.replaceFirst("(?is)(?:cookie状态|查看cookie|cookie查询|清除cookie|删除cookie|清空cookie)", " ");
 

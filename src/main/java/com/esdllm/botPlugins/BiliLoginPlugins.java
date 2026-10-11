@@ -4,6 +4,7 @@ import com.esdllm.bilibiliApi.bilibiliApi.Login;
 import com.esdllm.bilibiliApi.model.data.pojo.login.LoginCredential;
 import com.esdllm.bilibiliApi.model.data.pojo.login.QrCodeLogin;
 import com.esdllm.common.BotAdminChecker;
+import com.esdllm.common.CmdPrefix;
 import com.esdllm.common.CookieUtils;
 import com.esdllm.common.QrCodeUtils;
 import com.esdllm.config.LoadDSConfig;
@@ -64,11 +65,16 @@ import java.util.concurrent.atomic.AtomicLong;
 @Shiro
 public class BiliLoginPlugins {
 
-    /** 允许出现在前置的 CQ 码（@机器人 / 图片等），匹配时忽略 */
-    private static final String LEADING_CQ = "(\\[CQ:[^]]*\\]\\s*)*";
+    /**
+     * 命令的<b>可选前缀</b>：行首空白 / CQ 码（@机器人 / 图片等）/ <b>手打的 @机器人</b>。
+     *
+     * <p>直接取 {@link CmdPrefix#PREFIX}，与搜索 / 反刷屏 / cookie / 录播等命令<b>同一口径</b>；
+     * 前缀自带 flags，下面各条不用再写 {@code (?is)}（详见 {@link CmdPrefix}）。
+     */
+    private static final String CMD_PREFIX = CmdPrefix.PREFIX;
 
     /** `登录`（精确，不能写成前缀式，否则会把「登录状态」一起吃掉） */
-    private static final String CMD_LOGIN = "(?is)^" + LEADING_CQ + "(?:b站|B站)?登录\\s*$";
+    private static final String CMD_LOGIN = "^" + CMD_PREFIX + "(?:b站|B站)?登录\\s*$";
     /**
      * `登录状态`，也接受「查询登录状态」「登录查询」「凭据状态」等口语说法。
      *
@@ -76,7 +82,7 @@ public class BiliLoginPlugins {
      * 而上面的 {@link #CMD_LOGIN}（扫码登录）<b>必须保持精确匹配</b> ——
      * 一旦放宽，「登录状态」会被它先吃掉，用户只是想问一句，机器人却丢出一张二维码。
      */
-    private static final String CMD_LOGIN_STATUS = "(?is)^" + LEADING_CQ
+    private static final String CMD_LOGIN_STATUS = "^" + CMD_PREFIX
             + "(?:b站|B站)?(?:登录状态|登录查询|登录情况|查询登录状态|查询登录|凭据状态).*$";
 
     /**

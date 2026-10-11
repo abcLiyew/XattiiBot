@@ -39,15 +39,25 @@ import java.util.concurrent.ConcurrentHashMap;
  * {@code @Component}，经构造器注入每个 Bot ⇒ 一个 {@code @Around} 切面覆盖 100% 出站发送，
  * 零调用点改动。
  *
- * <p><b>判定规则</b>（按目标维度：群 {@code g:<id>} / 私聊 {@code p:<id>}，各一个滑窗）：
+ * <p><b>判定规则</b>（按 <b>目标 + 类别</b> 维度分桶：群 {@code g:<id>} / 私聊 {@code p:<id>}，
+ * 每桶一个滑窗）：
  * <ol>
- *   <li><b>频率</b>：窗口（默认 60s）内发往同一目标超过阈值 ⇒ 熔断。阈值<b>按消息类别</b>分档
+ *   <li><b>频率</b>：窗口（默认 60s）内发往同一目标的<b>同一类别</b>超过阈值 ⇒ 熔断。阈值按类别分档
  *       （调用方插件经 StackWalker 识别）：推送 push=4（自动触发、风险最高、最严）/
  *       签到运势 signin=12 / 今日老婆 wife=10 / 其它 other=10；私聊目标再扣上限帽 6；</li>
  *   <li><b>重复</b>：窗口内完全相同内容（SHA-1 指纹）达到阈值（默认 3）⇒ 熔断。</li>
  * </ol>
- * 熔断 = 之后 {@code sendGuardCircuitSeconds}（默认 60s）内发往该目标的消息<b>一律丢弃</b>，
+ *
+ * <p><b>⚠️ 为什么桶必须带上类别（2026-10-11 修）</b>：2.0.3 之前只按目标分桶，
+ * 但阈值是按类别取的 —— 于是<b>别类别的消息会把当前类别的额度吃掉</b>。线上真实事故：
+ * 群 105779173 里一人连刷「今日老婆」，5 条回复占满窗口；此时一条下播推送落进来，
+ * push 看到的是自己的 1 条 + 别人的 5 条 = 6 &gt; 4 ⇒ <b>熔断被算在 push 头上</b>，
+ * 整群 60s 消息全丢。桶带上类别后，push 只会被 push 自己的量挤爆，堵住了这条串扰。
+ *
+ * <p>熔断 = 之后 {@code sendGuardCircuitSeconds}（默认 60s）内发往该<b>目标</b>的消息<b>一律丢弃</b>，
  * 并向所有者私信告警（每目标 5 分钟冷却）。熔断自动恢复，无需人工介入。
+ * 注：<b>滑窗分桶按类别、熔断仍按目标</b>—— 判据要准（别误伤），但罚就要罚整个目标：
+ * 既然已经确认"这个目标在异常发信"，把该目标整个静音 60s 才是保险丝该有的行为。
  *
  * <p><b>被拦消息不抛异常</b>：返回 {@code retcode=-1 / status=failed} 的伪失败结果，
  * 与发送失败同形 —— 调用点原有的 retcode 判断天然兼容，不会因熔断引入新的异常路径。
@@ -122,7 +132,12 @@ public class SendGuardAspect {
     /** 告警旁路标记：告警私信本身跳过熔断检查（防"告警通道被熔断"的死锁） */
     private final ThreadLocal<Boolean> bypass = ThreadLocal.withInitial(() -> Boolean.FALSE);
 
-    /** 每目标滑窗：target -> 发送记录 */
+    /**
+     * 每「目标 + 类别」的滑窗：{@code g:<id>#push} / {@code p:<id>#wife} → 发送记录。
+     *
+     * <p>⚠️ 桶键<b>必须带类别</b>：阈值是按类别定的，若只按目标分桶，
+     * 其它类别的量会把当前类别的额度吃掉（线上事故见类注释）。
+     */
     private final Map<String, Deque<Entry>> windows = new ConcurrentHashMap<>();
 
     /** 熔断截止时刻：target -> epoch millis */
@@ -177,8 +192,7 @@ public class SendGuardAspect {
      *
      * <p>顺序：熔断中 ⇒ 直接丢（计数 suppressed）；否则滑窗计数 + 重复指纹判定，
      * 越线则置熔断并返回原因。本次越线的那条<b>也被丢弃</b>（它正是刷屏的一部分）。
-     */
-    /**
+     * <p>
      * 判定一次发送。返回 {@code null} 放行，否则熔断/丢弃。
      *
      * <p>顺序：熔断中 ⇒ 直接丢（计数 suppressed）；否则滑窗计数 + 重复指纹判定，
@@ -204,21 +218,18 @@ public class SendGuardAspect {
                 suppressed.merge(target, 1L, Long::sum);
                 return new Trip(TripReason.CIRCUIT, 0, 0);
             }
-            // 熔断解除：清空该目标滑窗 —— 否则旧记录还在窗内，第一条恢复消息会立刻再次越线，
+            // 熔断解除：清空该目标**所有类别**的滑窗 —— 否则旧记录还在窗内，第一条恢复消息会立刻再次越线，
             // "60s 后自动恢复"就变成不可预测的"最迟 120s 恢复"。熔断=罚时，出来就是清白身。
+            // ⚠️ 桶键是 {目标}#{类别}，所以这里必须按前缀扫，不能只 windows.get(target)
+            //   （get(target) 会拿到 null ⇒ 滑窗没清 ⇒ 恢复后第一条立刻又被熔断）。
             circuitUntil.remove(target, until);
             Long dropped = suppressed.remove(target);
-            Deque<Entry> stale = windows.get(target);
-            if (stale != null) {
-                synchronized (stale) {
-                    stale.clear();
-                }
-            }
+            clearWindows(target);
             log.warn("发送熔断已解除：{}（熔断期间丢弃 {} 条，滑窗已清零）", target, dropped == null ? 0 : dropped);
         }
 
-        String fp = fingerprint(params == null ? null : params.get("message"));
-        Deque<Entry> deque = windows.computeIfAbsent(target, k -> new ArrayDeque<>());
+        String fp = fingerprint(params.get("message"));
+        Deque<Entry> deque = windows.computeIfAbsent(bucketOf(target, category), k -> new ArrayDeque<>());
         synchronized (deque) {
             while (!deque.isEmpty() && now - deque.peekFirst().ts > windowMillis) {
                 deque.pollFirst();
@@ -302,6 +313,35 @@ public class SendGuardAspect {
             base = Math.min(base, privateLimit());
         }
         return base;
+    }
+
+    /**
+     * 清空某个目标下**全部类别**的滑窗（熔断解除时调用，见 {@link #check}）。
+     *
+     * <p>按 {@code 目标#} 前缀扫，因为桶键带了类别；调用时的目标只有群/私聊两种形态，
+     * 前缀不会串到别的目标（{@code g:105} 不会匹配 {@code g:1057}，因为后者的第 4 位是数字而非 {@code #}）。
+     */
+    private void clearWindows(String target) {
+        String prefix = target + '#';
+        for (Map.Entry<String, Deque<Entry>> e : windows.entrySet()) {
+            if (!e.getKey().startsWith(prefix)) {
+                continue;
+            }
+            Deque<Entry> stale = e.getValue();
+            synchronized (stale) {
+                stale.clear();
+            }
+        }
+    }
+
+    /**
+     * 滑窗桶键 = 目标 + 类别。
+     *
+     * <p>加上类别是<b>判据正确性</b>问题，不是优化：阈值按类别取，桶就必须按类别分，
+     * 否则低阈值的类别会被其它类别的正常量挤穿（线上事故见类注释）。
+     */
+    static String bucketOf(String target, String category) {
+        return target + '#' + category;
     }
 
     /** 目标标识：群消息 {@code g:<groupId>}，私聊 {@code p:<userId>}；提取不到返回 {@code null}。 */

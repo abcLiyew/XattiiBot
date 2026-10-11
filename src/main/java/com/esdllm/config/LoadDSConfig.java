@@ -2,6 +2,7 @@ package com.esdllm.config;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.esdllm.bilibiliApi.http.HttpPolicy;
+import com.esdllm.common.CmdPrefix;
 import com.esdllm.mapper.ConfigMapper;
 import com.esdllm.model.Admin;
 import com.esdllm.model.Config;
@@ -530,6 +531,32 @@ public class LoadDSConfig {
      */
     public static final String KEY_ANTI_SPAM_GROUP_LIMITS = "antiSpamGroupLimits";
 
+    // ==================== 今日老婆（每人每天次数上限） ====================
+    // 背景：TodayWifePlugins 原本对"同一个人当天抽几次"完全没约束 ——
+    // 一个人连点 11 次就是 11 条群消息，直接把出站熔断（sendGuardLimitWife=10/60s）打穿，
+    // 熔断后整个群 60s 内所有消息被丢弃，受伤的是全群而不只是刷屏那位。
+    // 所以这道闸做在**功能入口**（源头），而不是靠出口熔断兜。
+
+    /**
+     * 默认值：今日老婆<b>每人每天</b>可抽次数。{@code 1} = 「每天固定一位」。
+     *
+     * <p>语义（见 {@code TodayWifePlugins}）：
+     * <ul>
+     *   <li>{@code = 1}：当天第一次抽（走群轮转发牌）后<b>锁定</b>，再发「今日老婆」
+     *       返回<b>同一位</b>（幂等，不重新发牌）—— 即"每天固定"；</li>
+     *   <li>{@code &gt; 1}：每人每天至多抽这么多次，超了回一句提示；</li>
+     *   <li>{@code ≤ 0}：<b>不限</b>（1.0 之前的旧行为，仅用于回退对照）。</li>
+     * </ul>
+     */
+    public static final int DEFAULT_WIFE_DAILY_LIMIT = 1;
+
+    /**
+     * 配置键：今日老婆<b>每人每天</b>可抽次数（{@code ≤0} 不限）。默认 {@link #DEFAULT_WIFE_DAILY_LIMIT}。
+     *
+     * <p>热更 —— 走 {@link #updateConfig} 即生效，无需重启。
+     */
+    public static final String KEY_WIFE_DAILY_LIMIT = "wifeDailyLimit";
+
     // ==================== 出站发送熔断（SendGuard，防机器人自己刷屏） ====================
     // 与入站反刷屏（antiSpam*）的区别：那套防"别人刷"，这套防"自己刷"——
     // 任何推送循环 bug / 设计缺陷导致机器人向同一目标高频/重复发送时，
@@ -603,6 +630,30 @@ public class LoadDSConfig {
 
     /** 配置键：熔断告警冷却（分钟）。不配用 {@link #DEFAULT_SEND_GUARD_ALERT_COOLDOWN_MINUTES}。 */
     public static final String KEY_SEND_GUARD_ALERT_COOLDOWN_MINUTES = "sendGuardAlertCooldownMinutes";
+
+    /**
+     * 配置键：<b>命令前的 @ 是否必须指向机器人自己</b>（默认<b>开</b>）。
+     *
+     * <p>开：{@code @张三 搜视频 xxx} 不触发（那是群友互相 @，不该被插话）；
+     * 关：退回 2.0.4 的宽松行为（任何 {@code @某人} 都当命令头，只是"@ 过谁"不看）。
+     *
+     * <p>判定在 {@code common/CmdAddressedAspect}（handler 入口 AOP），
+     * 「机器人自己叫什么」由 {@code common/SelfNameRegistry} 从 OneBot 现拿
+     * —— <b>代码里不写死任何昵称，换号不作废</b>。
+     */
+    public static final String KEY_CMD_AT_ONLY = "cmdAtOnly";
+
+    /**
+     * 配置键：<b>与账号无关的通用称呼</b>（逗号/空白分隔，如 {@code 机器人,bot}），默认<b>空</b>。
+     *
+     * <p>账号昵称与各群群名片由 {@code common/SelfNameRegistry} 自动从 OneBot 取，
+     * 不需要配。这一项只用于"群里习惯喊机器人「机器人」"这类<b>跟账号无关</b>的叫法 ——
+     * 所以它放在配置里而不是代码常量里：写死就等于换个号/换个叫法都要改代码重发版。
+     *
+     * <p>热更：走 {@link #afterConfigChanged}（改完立即生效，无需重启）。改法：
+     * 聊天里发 {@code 开关 称呼 机器人,bot}，或直接改 config 表。
+     */
+    public static final String KEY_BOT_NAME_ALIASES = "botNameAliases";
 
 
     @Value(value = "${bot.qq}")
@@ -1008,6 +1059,10 @@ public class LoadDSConfig {
                 || KEY_ANTI_SPAM_ALERT_COOLDOWN_MINUTES.equals(key) || KEY_ANTI_SPAM_GROUPS.equals(key)
                 || KEY_ANTI_SPAM_USER_LIMITS.equals(key) || KEY_ANTI_SPAM_GROUP_LIMITS.equals(key)) {
             log.info("反刷屏参数已改：{} = {}", key, configMap.get(key));
+        } else if (KEY_WIFE_DAILY_LIMIT.equals(key)) {
+            int limit = intOf(key, DEFAULT_WIFE_DAILY_LIMIT);
+            log.info("今日老婆每人每天次数已设为 {}（1=每天固定一位（再抽回同一位）；>1=每人每天至多数次；≤0=不限）",
+                    limit);
         } else if (KEY_SEND_GUARD_ENABLED.equals(key)) {
             log.info("出站发送熔断总闸已{}（开启后：同一目标 60s 内超频发信或重复内容将被丢弃并熔断 60s，"
                     + "熔断时私信告警所有者；关闭时全部发送直通）",
@@ -1023,6 +1078,15 @@ public class LoadDSConfig {
             } else {
                 log.info("出站发送熔断参数已改：{} = {}", key, configMap.get(key));
             }
+        } else if (KEY_CMD_AT_ONLY.equals(key)) {
+            log.info("命令前的 @ 是否必须指向机器人自己：已{}（关闭后退回宽松：任何 @某人 都算命令头）",
+                    isEnabled(key, true) ? "开启（严格）" : "关闭");
+        } else if (KEY_BOT_NAME_ALIASES.equals(key)) {
+            // 立即生效：不等到 SelfNameRegistry 的下一轮心跳（最长 5 分钟）
+            CmdPrefix.setAliasNames(CmdPrefix.splitNames(configMap.get(key)));
+            log.info("机器人通用称呼已设为 {}（除此之外，账号昵称与各群群名片由 OneBot 自动获取）",
+                    CmdPrefix.aliasNames().isEmpty() ? "（空：只认 OneBot 给的昵称/群名片/QQ号）"
+                            : CmdPrefix.aliasNames());
         }
     }
 

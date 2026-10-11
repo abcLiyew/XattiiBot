@@ -8,15 +8,21 @@ import com.mikuac.shiro.core.Bot;
 import com.mikuac.shiro.dto.action.common.ActionList;
 import com.mikuac.shiro.dto.action.response.GroupMemberInfoResp;
 import com.mikuac.shiro.dto.event.message.AnyMessageEvent;
+import com.esdllm.common.CmdPrefix;
+import com.esdllm.config.LoadDSConfig;
 import com.mikuac.shiro.enums.AtEnum;
+import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Async;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.time.LocalDate;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashSet;
@@ -45,14 +51,45 @@ import java.util.concurrent.ThreadLocalRandom;
  *       不需要额外的成员变更监听。</li>
  * </ol>
  *
- * <p>⚠️ 轮转状态是<b>进程内内存</b>的（不落库）：重启后从新的一轮开始。
- * 代价只是"重启后可能重复抽到"，换来的是零 DDL、零配置项 ——
- * 与 {@code pushedDynamicIds} 那种"必须落库否则功能坏了"的情形不同，这里不值得。
+ * <p><b>每人每天次数闸（2026-10-11 加）</b>：{@code wifeDailyLimit}（默认 1，热更）。
+ * <ol>
+ *   <li><b>= 1（默认，"每天固定"）</b>：当天第一次抽中谁就<b>锁定</b>，之后再发「今日老婆」
+ *       回的是<b>同一位</b>，不再重新发牌；</li>
+ *   <li><b>&gt; 1</b>：每人每天至多抽这么多次，超了回一句提示；</li>
+ *   <li><b>≤ 0</b>：不限（旧行为，仅留作回退对照）。</li>
+ * </ol>
+ * 为什么要有这道闸：本插件原本对"一个人当天抽几次"毫无约束，连点 11 次就是 11 条群消息，
+ * 直接打穿出口熔断（{@code sendGuardLimitWife}=10/60s）；而熔断是按<b>群</b>生效的 ——
+ * 刷屏的人只被挡 60s，被连累的是整群 60s 收不到任何消息。所以闸门做在<b>入口</b>。
+ * 另：超限后<b>只提示一次</b>，之后静默 —— 超限了还一直回消息，等于把熔断的活自己又干一遍。
+ *
+ * <p>⚠️ 轮转状态与每日次数都是<b>进程内内存</b>的（不落库）：重启后轮转从新一轮开始、
+ * 当日次数清零（当天可以再抽一次）。代价只是"重启后可能重复/多抽一次"，
+ * 换来的是零 DDL —— 与 {@code pushedDynamicIds} 那种"必须落库否则功能坏了"的情形不同，
+ * 这里不值得为它开表。
  */
 @Slf4j
 @Shiro
 @Component
 public class TodayWifePlugins {
+
+    /**
+     * 命令的<b>可选前缀</b>：行首空白 / CQ 码（@机器人 / 图片等）/ <b>手打的 @机器人</b>。
+     *
+     * <p>取 {@link CmdPrefix#PREFIX}，与搜索 / cookie / 录播等命令<b>同一口径</b>。
+     *
+     * <p><b>2026-10-11 收紧</b>：改之前是 {@code .*今日老婆.*}（<b>「包含」</b>匹配），
+     * 于是 {@code @张三 今日老婆}、{@code 我想抽今日老婆} 都会触发 —— 群里互相 @ 时被机器人插话。
+     * 现在要求<b>关键词紧跟在（可选的）@机器人 之后</b>：
+     * <pre>
+     * 今日老婆              ← 仍然可以（裸命令不受影响）
+     * @Hana 今日老婆         ← 可以（手打 @机器人）
+     * [CQ:at,qq=…] 今日老婆   ← 可以（真 @ 由 shiro 剥掉后就是裸命令）
+     * @张三 今日老婆         ← ❌ 不再触发
+     * 我想抽今日老婆         ← ❌ 不再触发（代价：这类口语失灵，已与用户确认要收紧）
+     * </pre>
+     */
+    private static final String CMD_PREFIX = CmdPrefix.PREFIX;
 
     /**
      * QQ 头像接口，s 为头像尺寸
@@ -65,11 +102,49 @@ public class TodayWifePlugins {
     private static final int TIMEOUT_MILLIS = 5000;
 
     /**
+     * "今天"按哪个时区切 —— 群友在中国，跨天点必须是<b>北京时间 0 点</b>。
+     *
+     * <p>服务器时区（中国香港 = UTC+8）虽然也是 +8，但写成常量更稳：
+     * 换机器 / 容器镜像时区跑偏也不会让"今天"变成 UTC 的那一天。
+     */
+    private static final ZoneId ZONE = ZoneId.of("Asia/Shanghai");
+
+    @Resource
+    private LoadDSConfig loadDSConfig;
+
+    /**
      * 每个群的轮转状态。
      *
      * <p>键是群号；条目只有在群真的用过这个功能后才会出现（自然按群懒加载）。
      */
     private final Map<Long, GroupRotation> rotations = new ConcurrentHashMap<>();
+
+    /**
+     * 每人每天的抽签记录：群号 → (QQ → 当天记录)。条目按群/按人懒加载。
+     *
+     * <p>只在 {@code wifeDailyLimit > 0} 时才会被写；{@link #sweep()} 负责清非当天的。
+     */
+    private final Map<Long, Map<Long, DailyDraw>> dailyDraws = new ConcurrentHashMap<>();
+
+    /**
+     * 一个人在一个群里"今天"的抽签状态。
+     *
+     * <p>锁对象就是这个实例本身（{@code synchronized (record)}）：粒度是 (群, 人)，
+     * 把同一个人的并发请求串行化，不影响群里其他人。
+     */
+    private static final class DailyDraw {
+        /** 记录属于哪一天（{@link LocalDate#toEpochDay()}，按 {@link #ZONE} 切天） */
+        private long day;
+        /** 当天已抽次数（先占坑、抽失败回滚，所以"占坑中"也会暂时计 1） */
+        private int count;
+        /** 当天是否已经回过一次"抽满了"的提示 —— 只提示一次，之后静默 */
+        private boolean notified;
+        /**
+         * 当天第一次抽中的人；{@code wifeId} 就是"每天固定"的实现：
+         * 当天再抽不再发牌，直接把它回给用户。
+         */
+        private Long wifeId;
+    }
 
     /**
      * 一个群的「发牌」状态：本轮已抽过谁 + 上一次抽中的是谁。
@@ -83,7 +158,7 @@ public class TodayWifePlugins {
 
     @Async
     @AnyMessageHandler
-    @MessageHandlerFilter(cmd = ".*今日老婆.*", at = AtEnum.BOTH)
+    @MessageHandlerFilter(cmd = "^" + CMD_PREFIX + "今日老婆.*", at = AtEnum.BOTH)
     public void todayWife(Bot bot, AnyMessageEvent event) {
         Long groupId = event.getGroupId();
         Long qqUid = event.getUserId();
@@ -94,18 +169,113 @@ public class TodayWifePlugins {
             return;
         }
 
-        List<GroupMemberInfoResp> candidates = getCandidates(bot, groupId, qqUid, event.getSelfId());
-        if (Objects.isNull(candidates)) {
-            bot.sendMsg(event, MsgUtils.builder().at(qqUid).text(" 获取群成员失败，稍后再试试吧~").build(), false);
-            return;
-        }
-        if (candidates.isEmpty()) {
-            bot.sendMsg(event, MsgUtils.builder().at(qqUid).text(" 群里暂时没有别人，找不到老婆呢~").build(), false);
-            return;
-        }
+        int limit = dailyLimit();
+        long today = todayEpochDay();
+        DailyDraw record = recordOf(groupId, qqUid);
 
-        GroupMemberInfoResp wife = pickWife(groupId, candidates);
-        bot.sendMsg(event, buildWifeMsg(qqUid, wife), false);
+        // 每个用户一把锁：把"同一个人"的并发请求串行化。
+        // 必要性：本方法是 @Async 的，连点 3 次就并发进 3 个线程；若各自读到 count=0
+        // 就都能通过次数闸，闸门形同虚设。锁粒度是 (群, 人)，不阻塞其他人。
+        synchronized (record) {
+            // 跨天：第一次抽当天就把它清干净（所以初始化时的 day 填 0 也无所谓）
+            if (record.day != today) {
+                record.day = today;
+                record.count = 0;
+                record.notified = false;
+                record.wifeId = null;
+            }
+
+            // —— 次数闸 ——
+            if (limit > 0 && record.count >= limit) {
+                if (!record.notified) {
+                    // 只在"第一次超限"回一句，之后彻底静默 ——
+                    // 超限了还一直回消息，等于把出口熔断那份活自己又干一遍（还是刷屏）。
+                    record.notified = true;
+                    bot.sendMsg(event, buildLimitMsg(qqUid, record.wifeId, limit), false);
+                } else {
+                    log.debug("今日老婆：群 {} 用户 {} 当日已抽满 {} 次，静默忽略", groupId, qqUid, limit);
+                }
+                return;
+            }
+
+            // 先占坑后抽：抽失败（取成员失败/群里没人/头像挂了）会回滚，不白扣一次机会
+            record.count++;
+            boolean drawn = false;
+            try {
+                List<GroupMemberInfoResp> candidates = getCandidates(bot, groupId, qqUid, event.getSelfId());
+                if (Objects.isNull(candidates)) {
+                    bot.sendMsg(event, MsgUtils.builder().at(qqUid).text(" 获取群成员失败，稍后再试试吧~").build(), false);
+                    return;
+                }
+                if (candidates.isEmpty()) {
+                    bot.sendMsg(event, MsgUtils.builder().at(qqUid).text(" 群里暂时没有别人，找不到老婆呢~").build(), false);
+                    return;
+                }
+
+                GroupMemberInfoResp wife = pickWife(groupId, candidates);
+                bot.sendMsg(event, buildWifeMsg(qqUid, wife), false);
+                if (Objects.isNull(record.wifeId)) {
+                    // limit=1 的"固定"全靠它：只认当天第一次抽中的人
+                    record.wifeId = wife.getUserId();
+                }
+                drawn = true;
+            } finally {
+                if (!drawn) {
+                    record.count--;
+                }
+            }
+        }
+    }
+
+    /**
+     * 「今日老婆」每人每天可抽次数（{@code wifeDailyLimit}，热更）。
+     *
+     * @return 次数上限；{@code ≤0} 表示不限（旧行为）
+     */
+    private int dailyLimit() {
+        return loadDSConfig.intOf(LoadDSConfig.KEY_WIFE_DAILY_LIMIT, LoadDSConfig.DEFAULT_WIFE_DAILY_LIMIT);
+    }
+
+    /** 当前"天"（按 {@link #ZONE} 切），用于跨天重置。 */
+    private static long todayEpochDay() {
+        return LocalDate.now(ZONE).toEpochDay();
+    }
+
+    /** 取（或懒建）某人在某群的当天记录；跨天重置在调用方的临界区里做。 */
+    private DailyDraw recordOf(Long groupId, Long qqUid) {
+        Map<Long, DailyDraw> perUser = dailyDraws.computeIfAbsent(groupId, k -> new ConcurrentHashMap<>());
+        return perUser.computeIfAbsent(qqUid, k -> new DailyDraw());
+    }
+
+    /**
+     * 超限时的回复。
+     *
+     * <p>{@code limit = 1}（每天固定）时回<b>同一位</b>，让"每天一位"这件事对用户是可见的；
+     * 其余情况只回"抽满了"。
+     */
+    private String buildLimitMsg(Long qqUid, Long wifeId, int limit) {
+        if (limit == 1 && !Objects.isNull(wifeId)) {
+            return MsgUtils.builder()
+                    .at(qqUid).text(" 今天的老婆已经定啦，还是 ")
+                    .at(wifeId).text(" 哦（每人每天一次）")
+                    .build();
+        }
+        return MsgUtils.builder()
+                .at(qqUid).text(" 今天已经抽满 " + limit + " 次啦，明天再来吧~")
+                .build();
+    }
+
+    /** 定期清掉非当天的抽签记录；顺带把空掉的群条目一并摘掉，防 Map 只涨不降。 */
+    @Scheduled(fixedDelay = 3_600_000L)
+    public void sweep() {
+        try {
+            long today = todayEpochDay();
+            dailyDraws.values().forEach(perUser ->
+                    perUser.entrySet().removeIf(e -> e.getValue().day != today));
+            dailyDraws.entrySet().removeIf(e -> e.getValue().isEmpty());
+        } catch (Exception e) {
+            log.warn("今日老婆记录清扫异常", e);
+        }
     }
 
     /**

@@ -1,6 +1,7 @@
 package com.esdllm.botPlugins;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.esdllm.common.CmdPrefix;
 import com.esdllm.common.SignLevel;
 import com.esdllm.config.LoadDSConfig;
 import com.esdllm.model.SignInRecords;
@@ -32,6 +33,27 @@ import java.util.Random;
 @Shiro
 @Component
 public class SignInPlugins {
+
+    /**
+     * 命令的<b>可选前缀</b>：行首空白 / CQ 码（@机器人 等）/ <b>手打的 @机器人</b>。
+     *
+     * <p>取 {@link CmdPrefix#PREFIX}，与搜索 / cookie / 录播等命令<b>同一口径</b>：
+     * {@code 签到}、{@code [CQ:at,qq=213481590] 签到}、{@code @Hana 签到} 都命中，
+     * 而 {@code @张三 签到} 不命中（详见 {@link CmdPrefix}）。
+     * 前缀<b>自带 flags</b>，下面各条不用再写 {@code (?is)}。
+     *
+     * <p>⚠️ 命令词本身仍要求<b>整串匹配</b>（shiro 用 {@code matches()}）：{@code 签到}
+     * 后面不能再跟别的字 —— 与改造前一致，本次只放宽"命令词之前"。
+     */
+    private static final String CMD_PREFIX = CmdPrefix.PREFIX;
+
+    /** `签到`（精确） */
+    private static final String CMD_SIGN_IN = "^" + CMD_PREFIX + "签到";
+    /** `查询`（精确） */
+    private static final String CMD_QUERY = "^" + CMD_PREFIX + "查询";
+    /** `今日运势`（精确） */
+    private static final String CMD_LUCK = "^" + CMD_PREFIX + "今日运势";
+
     // 获取配置
     @Resource
     private LoadDSConfig loadDSConfig;
@@ -78,7 +100,7 @@ public class SignInPlugins {
     }
 
     @AnyMessageHandler
-    @MessageHandlerFilter(cmd = "签到", at = AtEnum.BOTH)
+    @MessageHandlerFilter(cmd = CMD_SIGN_IN, at = AtEnum.BOTH)
     public void signIn(Bot bot, AnyMessageEvent event) {
         Long groupId = event.getGroupId();
         Long qqUid = event.getUserId();
@@ -106,7 +128,7 @@ public class SignInPlugins {
     }
 
     @AnyMessageHandler
-    @MessageHandlerFilter(cmd = "查询", at = AtEnum.BOTH)
+    @MessageHandlerFilter(cmd = CMD_QUERY, at = AtEnum.BOTH)
     public void query(Bot bot, AnyMessageEvent event) {
         Long groupId = event.getGroupId();
         Long qqUid = event.getUserId();
@@ -128,7 +150,7 @@ public class SignInPlugins {
     }
 
     @AnyMessageHandler
-    @MessageHandlerFilter(cmd = "今日运势", at = AtEnum.BOTH)
+    @MessageHandlerFilter(cmd = CMD_LUCK, at = AtEnum.BOTH)
     public void todayLuck(Bot bot, AnyMessageEvent event) {
         Long groupId = Objects.isNull(event.getGroupId()) ? 0L : event.getGroupId();
         Long qqUid = event.getUserId();

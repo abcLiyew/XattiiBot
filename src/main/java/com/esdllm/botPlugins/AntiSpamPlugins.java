@@ -2,6 +2,7 @@ package com.esdllm.botPlugins;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.esdllm.common.BotAdminChecker;
+import com.esdllm.common.CmdPrefix;
 import com.esdllm.config.LoadDSConfig;
 import com.esdllm.model.Admin;
 import com.esdllm.service.AdminService;
@@ -88,16 +89,25 @@ public class AntiSpamPlugins {
 
     // ------------------------------------------------------------------ 命令正则（两两互斥：锚 ^$ + 结尾限定）
 
-    /** 允许出现在前置的 CQ 码（@机器人 / 图片等），匹配时忽略 */
-    private static final String LEADING_CQ = "(\\[CQ:[^]]*\\]\\s*)*";
+    /**
+     * 命令的<b>可选前缀</b>：行首空白 / CQ 码（@机器人 / 图片等）/ <b>手打的 @机器人</b>。
+     *
+     * <p>直接取 {@link CmdPrefix#PREFIX}，与 B 站搜索 / cookie / 录播等命令<b>同一口径</b>：
+     * {@code 反刷屏}、{@code [CQ:at,qq=213481590] 反刷屏}、{@code @Hana 反刷屏} 都命中，
+     * 而 {@code @张三 反刷屏} 不命中（为什么、以及为什么必须是大写 {@code U}，见 {@link CmdPrefix}）。
+     *
+     * <p>前缀<b>自带 flags</b>（{@code (?isU)}），所以下面各条不用再写 {@code (?is)}。
+     */
+    private static final String CMD_PREFIX = CmdPrefix.PREFIX;
+
     /** 状态面板：「反刷屏」/「反刷屏 状态」（结尾必须是状态/面板或直接结束，避免吃掉「反刷屏 开」） */
-    private static final String CMD_PANEL = "(?is)^" + LEADING_CQ + "(?:反刷屏|防刷屏)(?:\\s*(?:状态|面板))?$";
+    private static final String CMD_PANEL = "^" + CMD_PREFIX + "(?:反刷屏|防刷屏)(?:\\s*(?:状态|面板))?$";
     /** 总闸：「反刷屏 开 / 关」 */
-    private static final String CMD_TOGGLE = "(?is)^" + LEADING_CQ + "(?:反刷屏|防刷屏)\\s+(开|关)$";
+    private static final String CMD_TOGGLE = "^" + CMD_PREFIX + "(?:反刷屏|防刷屏)\\s+(开|关)$";
     /** 处置级别：「反刷屏 动作 alert」 */
-    private static final String CMD_ACTION = "(?is)^" + LEADING_CQ + "(?:反刷屏|防刷屏)\\s+动作\\s+(\\S+)$";
+    private static final String CMD_ACTION = "^" + CMD_PREFIX + "(?:反刷屏|防刷屏)\\s+动作\\s+(\\S+)$";
     /** 参数设置：「反刷屏 设置 窗口 60」（值里允许逗号/冒号，如阈值表） */
-    private static final String CMD_SET = "(?is)^" + LEADING_CQ + "(?:反刷屏|防刷屏)\\s+设置\\s+\\S+\\s+\\S.*$";
+    private static final String CMD_SET = "^" + CMD_PREFIX + "(?:反刷屏|防刷屏)\\s+设置\\s+\\S+\\s+\\S.*$";
 
     /** 合法的处置级别 */
     private static final Set<String> ACTIONS = Set.of("alert", "recall", "ban");
@@ -802,11 +812,12 @@ public class AntiSpamPlugins {
     }
 
     private static String setUsage() {
-        return "用法：反刷屏 设置 <项> <值>\n"
-                + "窗口 60（秒）　去重 3（次）　冷却 5（分钟）\n"
-                + "监控群 123,456 或 全部\n"
-                + "单人阈值 image:6,text:12,other:15\n"
-                + "全群阈值 image:20,text:40,other:50";
+        return """
+                用法：反刷屏 设置 <项> <值>
+                窗口 60（秒）　去重 3（次）　冷却 5（分钟）
+                监控群 123,456 或 全部
+                单人阈值 image:6,text:12,other:15
+                全群阈值 image:20,text:40,other:50""";
     }
 
     /** 把消息剥掉 CQ 码后按空白切成 token。 */
@@ -814,7 +825,8 @@ public class AntiSpamPlugins {
         if (message == null || message.length() > MAX_LENGTH) {
             return List.of();
         }
-        String body = message.replaceAll("\\[CQ:[^]]*]", " ").replace('　', ' ').trim();
+        // 先剥 CQ 码（真 @ 机器人 / 图片等），再剥「手打的 @机器人」
+        String body = CmdPrefix.stripMention(message.replaceAll("\\[CQ:[^]]*]", " ").replace('　', ' ')).trim();
         if (body.isEmpty()) {
             return List.of();
         }
@@ -823,12 +835,12 @@ public class AntiSpamPlugins {
 
     // ================================================================== 命令辅助
 
-    /** 取命令最后一个参数（剥掉 CQ 码后按空白切）。 */
+    /** 取命令最后一个参数（剥掉 CQ 码与手打的 @机器人 后按空白切）。 */
     private static String lastToken(String message) {
         if (message == null || message.length() > MAX_LENGTH) {
             return "";
         }
-        String body = message.replaceAll("\\[CQ:[^]]*]", " ").replace('　', ' ').trim();
+        String body = CmdPrefix.stripMention(message.replaceAll("\\[CQ:[^]]*]", " ").replace('　', ' ')).trim();
         if (body.isEmpty()) {
             return "";
         }

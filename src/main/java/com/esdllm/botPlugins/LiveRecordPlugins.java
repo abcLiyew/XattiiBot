@@ -1,6 +1,7 @@
 package com.esdllm.botPlugins;
 
 import com.esdllm.common.BotAdminChecker;
+import com.esdllm.common.CmdPrefix;
 import com.esdllm.contant.BiliBiliContant;
 import com.esdllm.model.LiveRecordFile;
 import com.esdllm.model.LiveRecordSub;
@@ -88,8 +89,15 @@ import java.util.concurrent.atomic.AtomicBoolean;
 @Shiro
 public class LiveRecordPlugins {
 
-    /** 允许出现在命令前的 CQ 码（@机器人 / 表情等），匹配时忽略 */
-    private static final String CQ = "(\\[CQ:[^]]*\\]\\s*)*";
+    /**
+     * 命令的<b>可选前缀</b>：行首空白 / CQ 码（@机器人 / 表情等）/ <b>手打的 @机器人</b>。
+     *
+     * <p>直接取 {@link CmdPrefix#PREFIX}，与搜索 / 反刷屏 / cookie 等命令<b>同一口径</b>：
+     * {@code 录播订阅 1024}、{@code [CQ:at,qq=213481590] 录播订阅 1024}、
+     * {@code @Hana 录播订阅 1024} 都命中，而 {@code @张三 录播订阅 1024} 不命中
+     * （详见 {@link CmdPrefix}）。
+     */
+    private static final String CMD_PREFIX = CmdPrefix.PREFIX;
 
     /** 房间号 / 编号：正整数，长度设上限纯粹是防呆 */
     private static final String ID = "\\d{1,15}";
@@ -111,28 +119,28 @@ public class LiveRecordPlugins {
      */
 
     // ── 订阅（群内管理员；群里记到本群，私聊里是全局订阅）
-    private static final String CMD_SUB_ADD = "(?is)^" + CQ + "录播订阅\\s+" + ID + "\\s*$";
-    private static final String CMD_SUB_LIST = "(?is)^" + CQ + "录播订阅列表\\s*$";
-    private static final String CMD_SUB_DEL = "(?is)^" + CQ + "录播取消订阅\\s+" + ID + "\\s*$";
-    private static final String CMD_SUB_SWITCH = "(?is)^" + CQ + "录播开关\\s+" + ID + "\\s+\\S+\\s*$";
+    private static final String CMD_SUB_ADD = "^" + CMD_PREFIX + "录播订阅\\s+" + ID + "\\s*$";
+    private static final String CMD_SUB_LIST = "^" + CMD_PREFIX + "录播订阅列表\\s*$";
+    private static final String CMD_SUB_DEL = "^" + CMD_PREFIX + "录播取消订阅\\s+" + ID + "\\s*$";
+    private static final String CMD_SUB_SWITCH = "^" + CMD_PREFIX + "录播开关\\s+" + ID + "\\s+\\S+\\s*$";
 
     // ── 取用（群内管理员）
-    private static final String CMD_FILE_LIST = "(?is)^" + CQ + "录播列表(?:\\s+" + ID + ")?\\s*$";
-    private static final String CMD_FILE_GET = "(?is)^" + CQ + "录播下载\\s+" + ID + "\\s*$";
-    private static final String CMD_FILE_KEEP = "(?is)^" + CQ + "录播保留\\s+" + ID + "\\s*$";
-    private static final String CMD_FILE_UNKEEP = "(?is)^" + CQ + "录播取消保留\\s+" + ID + "\\s*$";
-    private static final String CMD_FILE_DEL = "(?is)^" + CQ + "删除录播\\s+" + ID + "\\s*$";
-    private static final String CMD_STATUS = "(?is)^" + CQ + "录播状态\\s*$";
-    private static final String CMD_ADDR = "(?is)^" + CQ + "录播地址\\s*$";
+    private static final String CMD_FILE_LIST = "^" + CMD_PREFIX + "录播列表(?:\\s+" + ID + ")?\\s*$";
+    private static final String CMD_FILE_GET = "^" + CMD_PREFIX + "录播下载\\s+" + ID + "\\s*$";
+    private static final String CMD_FILE_KEEP = "^" + CMD_PREFIX + "录播保留\\s+" + ID + "\\s*$";
+    private static final String CMD_FILE_UNKEEP = "^" + CMD_PREFIX + "录播取消保留\\s+" + ID + "\\s*$";
+    private static final String CMD_FILE_DEL = "^" + CMD_PREFIX + "删除录播\\s+" + ID + "\\s*$";
+    private static final String CMD_STATUS = "^" + CMD_PREFIX + "录播状态\\s*$";
+    private static final String CMD_ADDR = "^" + CMD_PREFIX + "录播地址\\s*$";
 
     // ── 网页预览（botadmin 及以上）
-    private static final String CMD_WEB = "(?is)^" + CQ + "录播网页\\s*$";
-    private static final String CMD_WEB_RESET = "(?is)^" + CQ + "录播网页重置\\s*$";
-    private static final String CMD_WEB_CODE = "(?is)^" + CQ + "录播管理码\\s*$";
-    private static final String CMD_WEB_CODE_RESET = "(?is)^" + CQ + "录播管理码重置\\s*$";
+    private static final String CMD_WEB = "^" + CMD_PREFIX + "录播网页\\s*$";
+    private static final String CMD_WEB_RESET = "^" + CMD_PREFIX + "录播网页重置\\s*$";
+    private static final String CMD_WEB_CODE = "^" + CMD_PREFIX + "录播管理码\\s*$";
+    private static final String CMD_WEB_CODE_RESET = "^" + CMD_PREFIX + "录播管理码重置\\s*$";
 
     // ── 运维（仅所有者）
-    private static final String CMD_TIDY = "(?is)^" + CQ + "录播整理\\s*$";
+    private static final String CMD_TIDY = "^" + CMD_PREFIX + "录播整理\\s*$";
 
     /** 一页显示多少场 */
     private static final int PAGE_SIZE = 8;
@@ -818,11 +826,23 @@ public class LiveRecordPlugins {
     /**
      * 取命令参数。
      *
-     * <p>先把 CQ 码换成空格再 trim：群里通常是「@机器人 录播订阅 1024」，
+     * <p>先把 CQ 码换成空格再 strip：群里通常是「@机器人 录播订阅 1024」，
      * 不剥掉前置的 {@code [CQ:at,qq=...]} 就永远匹配不到命令头。
+     *
+     * <p>⚠️ 还要剥<b>手打的 {@code @机器人}</b>：那种写法只是普通文本，不是 CQ 段，
+     * 光剥 CQ 码剥不掉，会变成 {@code @Hana 录播订阅 1024} 里的 {@code @Hana} 顶在
+     * 最前面 ⇒ {@link #argsAfter} 的 {@code startsWith} 直接不成立，参数取成空串。
+     * 先按<b>已知称呼</b>精确剥（{@code @Hana录播订阅 1024} 这种中间没空格的也只剥 {@code @Hana}）；
+     * 认不出就整段"@ + 一串非空白"剥掉 —— 能走到这里的消息，前置 @ 已经被
+     * {@code CmdAddressedAspect} 判过是"在跟机器人说"了。
      */
     private static String body(String message) {
-        return message == null ? "" : message.replaceAll("\\[CQ:[^]]*]", " ").trim();
+        if (message == null) {
+            return "";
+        }
+        String text = message.replaceAll("\\[CQ:[^]]*]", " ");
+        text = CmdPrefix.stripMention(text);
+        return text.strip();
     }
 
     /** {@code argsAfter("录播订阅 1024", "录播订阅")} → {@code "1024"} */
