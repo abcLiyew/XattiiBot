@@ -557,6 +557,68 @@ public class LoadDSConfig {
      */
     public static final String KEY_WIFE_DAILY_LIMIT = "wifeDailyLimit";
 
+    // ==================== 今日老婆（离婚冷静期） ====================
+    // 背景：`wifeDailyLimit=1` 时当天老婆是**锁定**的（再抽回同一位），群友想换人只能等第二天。
+    // 「离婚」给一条当天换人的路，但不能一按就换 —— 否则"锁一位"这条规则等于不存在，
+    // 群里会变成"抽到不喜欢的就离婚重抽"的连点场景（又一次把出站熔断打穿）。
+    // 所以离婚要走**冷静期**：申请 → 等 → 再发一次「离婚」才生效。
+
+    /**
+     * 默认值：离婚功能总闸，<b>缺省开</b>。
+     */
+    public static final int DEFAULT_WIFE_DIVORCE_ENABLED = 1;
+
+    /** 配置键：离婚功能总闸。1 开 / 0 关。<b>缺省开</b>（本来就是给"每天固定一位"配的出口）。 */
+    public static final String KEY_WIFE_DIVORCE_ENABLED = "wifeDivorceEnabled";
+
+    /**
+     * 默认值：<b>首次</b>离婚冷静期（分钟），同时也是冷静期的<b>下限</b>。
+     *
+     * <p>所以默认只给 30 —— 这是"最小可感知的等待时长"：短到群友能接受，
+     * 长到足以让"抽到不喜欢的立刻离婚重抽"这件事故意变得不好使。
+     */
+    public static final int DEFAULT_WIFE_DIVORCE_BASE_MINUTES = 30;
+
+    /**
+     * 配置键：首次离婚冷静期（分钟）。不配用 {@link #DEFAULT_WIFE_DIVORCE_BASE_MINUTES}。
+     *
+     * <p>每多申请一次，等待时长<b>翻倍</b>：30 → 60 → 120 → 240 …
+     */
+    public static final String KEY_WIFE_DIVORCE_BASE_MINUTES = "wifeDivorceBaseMinutes";
+
+    /**
+     * 默认值：冷静期上限（分钟），默认 1440 = 24 小时（≈ 跨过"今天"）。
+     *
+     * <p>为什么不封顶到无限：翻倍是指数，第 6 次就是 16 小时、第 7 次超过一天 ——
+     * 那不叫冷静期，叫封号。封顶在"今天之内基本等不到"就够了。
+     */
+    public static final int DEFAULT_WIFE_DIVORCE_MAX_MINUTES = 24 * 60;
+
+    /** 配置键：冷静期上限（分钟）。不配用 {@link #DEFAULT_WIFE_DIVORCE_MAX_MINUTES}。 */
+    public static final String KEY_WIFE_DIVORCE_MAX_MINUTES = "wifeDivorceMaxMinutes";
+
+    /**
+     * 默认值：每人每天最多<b>发起</b>几离婚次申请（含被撤回的）。{@code ≤0} 不限。
+     *
+     * <p>与冷静期是两把锁：冷静期防"立刻重抽"，这道闸防"反复申请/撤回"——
+     * 撤回不消耗冷静期，没有这道闸就成了"申请（撤回）申请（撤回）…"刷屏。
+     */
+    public static final int DEFAULT_WIFE_DIVORCE_MAX_PER_DAY = 3;
+
+    /** 配置键：每人每天最多发起几次离婚申请。<b>只数"发起"，不数撤回</b>；撤回不退还次数。不配用 {@link #DEFAULT_WIFE_DIVORCE_MAX_PER_DAY}。 */
+    public static final String KEY_WIFE_DIVORCE_MAX_PER_DAY = "wifeDivorceMaxPerDay";
+
+    /**
+     * 默认值：冷静期内"还没到时间"的提醒冷却（分钟）。{@code 0} = 每次都提醒（只是不会因此重置倒计时）。
+     *
+     * <p>{@code >0} 时：同一冷静期内提醒过一次后，冷却内再发「离婚」直接静默（一次都不回），
+     * 免得"还差几分钟"的那几分钟被反复催。
+     */
+    public static final int DEFAULT_WIFE_DIVORCE_REMIND_COOLDOWN_MINUTES = 0;
+
+    /** 配置键：冷静期内提醒冷却（分钟）。不配用 {@link #DEFAULT_WIFE_DIVORCE_REMIND_COOLDOWN_MINUTES}。 */
+    public static final String KEY_WIFE_DIVORCE_REMIND_COOLDOWN_MINUTES = "wifeDivorceRemindCooldownMinutes";
+
     // ==================== 出站发送熔断（SendGuard，防机器人自己刷屏） ====================
     // 与入站反刷屏（antiSpam*）的区别：那套防"别人刷"，这套防"自己刷"——
     // 任何推送循环 bug / 设计缺陷导致机器人向同一目标高频/重复发送时，
@@ -1063,6 +1125,17 @@ public class LoadDSConfig {
             int limit = intOf(key, DEFAULT_WIFE_DAILY_LIMIT);
             log.info("今日老婆每人每天次数已设为 {}（1=每天固定一位（再抽回同一位）；>1=每人每天至多数次；≤0=不限）",
                     limit);
+        } else if (KEY_WIFE_DIVORCE_ENABLED.equals(key)) {
+            log.info("今日老婆-离婚功能已{}（开启后：可申请离婚，走冷静期，到点再发一次「离婚」才生效）",
+                    isEnabled(key, true) ? "开启" : "关闭");
+        } else if (KEY_WIFE_DIVORCE_BASE_MINUTES.equals(key)) {
+            log.info("今日老婆-首次离婚冷静期已设为 {} 分钟（每多申请一次翻倍，上限 {} 分钟）",
+                    intOf(key, DEFAULT_WIFE_DIVORCE_BASE_MINUTES),
+                    intOf(KEY_WIFE_DIVORCE_MAX_MINUTES, DEFAULT_WIFE_DIVORCE_MAX_MINUTES));
+        } else if (KEY_WIFE_DIVORCE_MAX_MINUTES.equals(key)
+                || KEY_WIFE_DIVORCE_MAX_PER_DAY.equals(key)
+                || KEY_WIFE_DIVORCE_REMIND_COOLDOWN_MINUTES.equals(key)) {
+            log.info("今日老婆-离婚参数已改：{} = {}", key, configMap.get(key));
         } else if (KEY_SEND_GUARD_ENABLED.equals(key)) {
             log.info("出站发送熔断总闸已{}（开启后：同一目标 60s 内超频发信或重复内容将被丢弃并熔断 60s，"
                     + "熔断时私信告警所有者；关闭时全部发送直通）",
