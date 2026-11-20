@@ -119,8 +119,8 @@ public class SignInPlugins {
                             "当前好感度：" + sign.getEmpirical() + "\n" +
                             "好感度等级：" + sign.getSignLevel().getOpinion() + "\n" +
                             "对你的态度：" + sign.getSignLevel().getAttitude() + "\n" +
-                            "距离下一级：" + (sign.getSignLevel().isMax() ? "已满级"
-                                    : distanceNextBigDecimal.setScale(2, RoundingMode.HALF_UP).doubleValue()))
+                            (sign.getSignLevel().isMax() ? "已满级"
+                                    : "距离下一级"+distanceNextBigDecimal.setScale(2, RoundingMode.HALF_UP).doubleValue()))
                     .build();
             bot.sendMsg(event, msg, false);
         } else {
@@ -146,7 +146,7 @@ public class SignInPlugins {
                         "好感度等级：" + signLevel.getOpinion() + "\n" +
                         "对你的态度：" + signLevel.getAttitude() + "\n" +
                         // 满级时不再算"差值"：那是拿 1000 的阈值减出来的假数字
-                        "距离下一级：" + (signLevel.isMax() ? "已满级" : distanceNext))
+                        (signLevel.isMax() ? "已满级" : "距离下一级："+distanceNext))
                 .build();
         bot.sendMsg(event, msg, false);
     }
