@@ -250,7 +250,20 @@ public class LoadDSConfig {
     public static final int DEFAULT_RECORD_QUALITY = 10000;
     /** 默认交付模式：auto（能推断出 NapCat 可达基址就走 URL，否则本地路径） */
     public static final String DEFAULT_RECORD_DELIVERY_MODE = "auto";
-    /** 默认录播文件服务监听端口 */
+    /**
+     * 默认录播文件服务监听端口。
+     *
+     * <p>🔴 <b>绝不能等于 {@code server.port}（2233）</b>：{@code RecordFileServer} 用 JDK 自带的
+     * {@code HttpServer} <b>单独 bind 一个端口</b>，与 Tomcat 是两个互不相干的 socket。
+     * 一旦同号，先启动的那个占住端口，后启动的就会
+     * {@code APPLICATION FAILED TO START: Port 2233 was already in use} ——
+     * 而失败方是 Tomcat ⇒ 整个进程起不来。
+     *
+     * <p>2026-11-20 生产上真挂了一次：这个默认值被误改成 2233 并随 2.0.10 打包上线，
+     * 表现是"启动到一半就报端口占用、进程却不退出"，日志里真正的线索是
+     * {@code RecordFileServer : 录播文件服务已启动：监听 0.0.0.0:2233} ——
+     * 它比 Tomcat 先绑上了同一号。
+     */
     public static final int DEFAULT_RECORD_SERVE_PORT = 2335;
     /** 默认监听地址（0.0.0.0 = 所有网卡；可收紧到 docker 网桥地址） */
     public static final String DEFAULT_RECORD_SERVE_BIND = "0.0.0.0";

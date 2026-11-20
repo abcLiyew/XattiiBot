@@ -2,9 +2,11 @@ package com.esdllm.controller;
 
 import com.esdllm.common.HttpFileSupport;
 import com.esdllm.model.LiveRecordFile;
+import com.esdllm.model.LiveRecordSub;
 import com.esdllm.service.LiveRecordService;
 import com.esdllm.service.RecordWebAuth;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.annotation.PostConstruct;
 import jakarta.annotation.Resource;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -26,11 +28,13 @@ import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 /**
  * 「录播网页」—— 让<b>群成员的浏览器</b>直接看录播。
@@ -145,8 +149,12 @@ public class RecordWebController {
         List<LiveRecordFile> rows = records.listFilesOfRooms(pageNo, PAGE_SIZE, scope);
 
         List<Map<String, Object>> items = new ArrayList<>();
+        // 全群视图（管理码）下，"这一场是谁的"是必须回答的问题 —— 否则 8 张卡片长得一模一样，
+        // 想删某个群的东西只能靠记忆。只在 admin 视图构建这张表：群视图里所有场次本来就属于本群，
+        // 多查一次纯属浪费。
+        Map<Long, List<Long>> groupsOfRoom = view.admin() ? groupsOfRoom() : Map.of();
         for (LiveRecordFile row : rows) {
-            items.add(item(row));
+            items.add(item(row, groupsOfRoom));
         }
 
         Map<String, Object> body = new LinkedHashMap<>();
@@ -166,8 +174,33 @@ public class RecordWebController {
         return ResponseEntity.ok(body);
     }
 
+    /**
+     * 房间 → 订阅它的群列表（只给全群视图用）。
+     *
+     * <p>一次查全表而不是"每行查一次"：订阅总数是几十条量级，一页 8 行就是 8 次查询，
+     * 而管理台每翻一页都要重来一遍。这里是典型的 N+1，顺手就避掉了。
+     *
+     * <p>同一个房间被多个群订阅时是<b>多行</b>（录制仍只一路），所以值是个列表。
+     */
+    private Map<Long, List<Long>> groupsOfRoom() {
+        Map<Long, List<Long>> map = new LinkedHashMap<>();
+        try {
+            for (LiveRecordSub sub : records.listSubs()) {
+                if (sub.getRoomId() == null || sub.getGroupId() == null) {
+                    continue;               // 全局订阅（group_id 为空）不归属任何群，前端显示"全局"
+                }
+                map.computeIfAbsent(sub.getRoomId(), k -> new ArrayList<>()).add(sub.getGroupId());
+            }
+        } catch (Throwable t) {
+            // 这张表只是"辅助信息"：查不到就不显示归属，绝不能让整个列表 500
+            log.warn("查房间归属失败，本次列表不显示群号：{}", t.toString());
+            return Map.of();
+        }
+        return map;
+    }
+
     /** 一行场次的 JSON。字段名全部小写开头，前端直接对应。 */
-    private Map<String, Object> item(LiveRecordFile row) {
+    private Map<String, Object> item(LiveRecordFile row, Map<Long, List<Long>> groupsOfRoom) {
         boolean recording = "RECORDING".equalsIgnoreCase(row.getStatus());
         boolean failed = "FAILED".equalsIgnoreCase(row.getStatus());
         Path file = failed ? null : records.fileOf(row);
@@ -190,6 +223,13 @@ public class RecordWebController {
         item.put("playable", !recording && !failed && file != null);
         item.put("missingFile", !recording && !failed && file == null);
         item.put("mp4", mp4);
+        // 「实时」= 正在录 + 预览切片已就绪（ffmpeg 写出第一个 m3u8 之后才为真）。
+        // 前端据此决定显示「▶ 实时」还是只显示「● 录制中」徽章 —— 两者不是一回事：
+        // 刚起录的头几秒确实在录，但还没有可播的切片。
+        item.put("live", recording && records.previewDirOf(row) != null);
+        // 归属群（只有全群视图才非空）。空列表 = 没有任何群订阅它（例如取消订阅后留下的历史场次）
+        List<Long> groups = groupsOfRoom.get(row.getRoomId());
+        item.put("groups", groups == null ? List.of() : groups);
         return item;
     }
 
@@ -279,7 +319,6 @@ public class RecordWebController {
 
     /**
      * 把文件按 HTTP 语义发出去（支持单段 Range）。
-     *
      * <p>Range 的解析与搬运都在 {@link HttpFileSupport} 里 —— 与给 NapCat 下载那条路
      * 共用同一份实现（那种"复制两份、只改一处"的代码不会报错，只会有一个出口能越界读）。
      */
@@ -294,8 +333,7 @@ public class RecordWebController {
         }
         response.setContentType(HttpFileSupport.contentType(name));
         response.setHeader("Accept-Ranges", "bytes");
-        response.setHeader("Content-Disposition", (attachment ? "attachment" : "inline")
-                + "; filename=\"" + HttpFileSupport.safeAsciiName(name) + "\"");
+        response.setHeader("Content-Disposition", HttpFileSupport.contentDisposition(name, attachment));
         response.setContentLengthLong(range.length());
         if (range.partial()) {
             response.setStatus(HttpServletResponse.SC_PARTIAL_CONTENT);
@@ -305,6 +343,174 @@ public class RecordWebController {
         try (InputStream in = Files.newInputStream(file);
              OutputStream out = response.getOutputStream()) {
             HttpFileSupport.copyRange(in, out, range.start(), range.length());
+        }
+    }
+
+    // ================================================================== 实时预览（HLS）
+
+    /**
+     * 实时预览索引：{@code GET /record/live/{token}/{fid}/index.m3u8}。
+     *
+     * <p>读的是录制时 ffmpeg 的第二路输出（{@code <场次>/preview/pNNN/index.m3u8}），
+     * <b>不是</b> flv —— flv 没索引、录制中根本没法播（理由见 {@code LiveRecorder#recordCommand}）。
+     *
+     * <p>⚠️ 必须<b>改写切片路径</b>：ffmpeg 是用绝对路径写的 {@code -hls_segment_filename}，
+     * 原样返回的话浏览器会去请求 {@code /record/seg00001.ts} 这种容器内的路径（必然 404）。
+     * 这里统一改写成相对本接口的 {@code seg/<文件名>}，于是切片端点能拿到同一个 {@code token}/{fid}
+     * 再做一次权限校验 —— <b>切片也走鉴权，不能变成"知道文件名就能拉"</b>。
+     */
+    @GetMapping(value = "/live/{token}/{fid}/index.m3u8")
+    public ResponseEntity<?> liveIndex(@PathVariable String token, @PathVariable Long fid) {
+        RecordWebAuth.View view = resolveView(token);
+        if (view == null) {
+            return ResponseEntity.status(404).body(Map.of("ok", false, "error", "链接无效或已失效"));
+        }
+        LiveRecordFile row = records.findFile(fid);
+        if (row == null) {
+            return ResponseEntity.status(404).body(Map.of("ok", false, "error", "找不到编号 " + fid + " 的录播"));
+        }
+        if (!inScope(scopeOf(view), row)) {
+            return ResponseEntity.status(403).body(Map.of("ok", false, "error", "编号 " + fid + " 不在可见范围内"));
+        }
+        Path dir = records.previewDirOf(row);
+        if (dir == null) {
+            return ResponseEntity.status(404).body(Map.of("ok", false,
+                    "error", "这一场现在没有实时画面（可能刚起录、还没写出切片，或已经录完）"));
+        }
+        List<String> lines;
+        try {
+            lines = Files.readAllLines(dir.resolve("index.m3u8"), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            // ffmpeg 每 2 秒重写一次 m3u8，极少数时刻会撞上"正在写"的窗口。
+            // 回 503 让播放器自己重试，比回 404（= 这一场没有实时）准确得多
+            log.debug("读实时索引失败（可能正被 ffmpeg 重写）：{}", e.toString());
+            return ResponseEntity.status(503).body(Map.of("ok", false, "error", "索引正在生成，请稍候"));
+        }
+
+        return ResponseEntity.ok()
+                .contentType(MediaType.parseMediaType("application/vnd.apple.mpegurl"))
+                .cacheControl(CacheControl.noStore())
+                .body(rewritePlaylist(lines));
+    }
+
+    /**
+     * 把 ffmpeg 写的 m3u8 改写成"切片都指向本服务的 {@code seg/} 端点"。
+     *
+     * <p>抽成独立方法是为了能<b>单独验</b>：这段是纯字符串逻辑，一旦把注释行也改写
+     * （或者把 {@code #EXTINF} 后面的时长当切片名），播放器表现是"列表能拿到、就是不出画面"，
+     * 在浏览器里极难定位。实测 ffmpeg 6.1 写的是纯文件名（不是绝对路径），
+     * 但万一以后换版本改成绝对路径，这里取 basename 也能兜住。
+     */
+    static String rewritePlaylist(List<String> lines) {
+        StringBuilder sb = new StringBuilder(lines.size() * 24);
+        for (String line : lines) {
+            String t = line.trim();
+            if (t.isEmpty()) {
+                continue;
+            }
+            if (t.startsWith("#")) {
+                sb.append(t).append('\n');
+                continue;
+            }
+            int slash = Math.max(t.lastIndexOf('/'), t.lastIndexOf('\\'));
+            sb.append("seg/").append(slash >= 0 ? t.substring(slash + 1) : t).append('\n');
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 实时预览切片：{@code GET /record/live/{token}/{fid}/seg/seg00001.ts}。
+     *
+     * <p>⚠️ 切片名走<b>白名单正则</b>，不拼任意路径：这是唯一一个"文件名来自 URL"的入口，
+     * 不校验就能用 {@code ../} 读到磁盘上任何东西（{@code token} 也挡不住这个）。
+     *
+     * <p>{@code delete_segments} 会把窗口外的切片删掉，所以"列表里有、点下去 404"是正常现象
+     * —— 播放器遇到 404 会回到索引重新对齐，不需要额外处理。
+     */
+    @GetMapping("/live/{token}/{fid}/seg/{name}")
+    public void liveSegment(@PathVariable String token, @PathVariable Long fid,
+                            @PathVariable String name,
+                            HttpServletResponse response) throws IOException {
+        RecordWebAuth.View view = resolveView(token);
+        if (view == null) {
+            writeError(response, 404, "链接无效或已失效");
+            return;
+        }
+        if (!SEGMENT_NAME.matcher(name).matches()) {
+            writeError(response, 400, "切片名不合法");
+            return;
+        }
+        LiveRecordFile row = records.findFile(fid);
+        if (row == null) {
+            writeError(response, 404, "找不到编号 " + fid + " 的录播");
+            return;
+        }
+        if (!inScope(scopeOf(view), row)) {
+            writeError(response, 403, "编号 " + fid + " 不在可见范围内");
+            return;
+        }
+        Path dir = records.previewDirOf(row);
+        if (dir == null) {
+            writeError(response, 404, "这一场现在没有实时画面");
+            return;
+        }
+        Path file = dir.resolve(name);
+        if (!Files.isRegularFile(file)) {
+            // 已被 delete_segments 回收，或播放器在追一个刚滚出窗口的切片
+            writeError(response, 404, "切片已滚出窗口");
+            return;
+        }
+        long total = Files.size(file);
+        response.setContentType("video/mp2t");
+        response.setHeader("Accept-Ranges", "bytes");
+        response.setContentLengthLong(total);
+        try (InputStream in = Files.newInputStream(file);
+             OutputStream out = response.getOutputStream()) {
+            in.transferTo(out);
+        }
+    }
+
+    /**
+     * HLS 播放库（hls.js）：{@code GET /record/hls.js}。
+     *
+     * <p>为什么不从 CDN 引：这个机器人在国内群聊里用，公网 CDN 时通时不通；
+     * 而"点开实时却没画面"是最难解释的故障。打进 jar 只有 400KB，一次性成本换确定性。
+     *
+     * <p>⚠️ 它<b>不是</b>凭据：内容对所有人一样、不含任何录播数据，所以公开可缓存。
+     * （Safari 原生支持 HLS，根本不加载它；Chrome/Edge 需要。）
+     */
+    @GetMapping(value = "/hls.js", produces = "application/javascript; charset=utf-8")
+    public ResponseEntity<byte[]> hlsJs() {
+        byte[] js = HLS_JS;
+        if (js == null) {
+            return ResponseEntity.status(404).body(new byte[0]);
+        }
+        return ResponseEntity.ok()
+                .contentType(MediaType.parseMediaType("application/javascript; charset=utf-8"))
+                .cacheControl(CacheControl.maxAge(Duration.ofDays(7)).cachePublic())
+                .body(js);
+    }
+
+    /** hls.js 的内容（首次请求时读一次）；缺失时保持 {@code null}，端点回 404。 */
+    private static volatile byte[] HLS_JS;
+
+    /** 切片文件名的白名单：只允许 {@code seg} + 数字 + {@code .ts} */
+    private static final Pattern SEGMENT_NAME = Pattern.compile("^seg\\d{1,6}\\.ts$");
+
+    private static final String HLS_JS_RESOURCE = "record/hls.min.js";
+
+    @PostConstruct
+    void loadHlsJs() {
+        try (InputStream in = getClass().getClassLoader().getResourceAsStream(HLS_JS_RESOURCE)) {
+            if (in == null) {
+                log.warn("录播网页的播放库 {} 不在 classpath 里 —— 实时预览在 Chrome 上会不可用"
+                        + "（Safari 用原生 HLS，不受影响）", HLS_JS_RESOURCE);
+                return;
+            }
+            HLS_JS = in.readAllBytes();
+            log.info("录播实时预览播放库已就绪：{}（{} KB）", HLS_JS_RESOURCE, HLS_JS.length / 1024);
+        } catch (Throwable t) {
+            log.warn("加载 {} 失败，实时预览在 Chrome 上不可用：{}", HLS_JS_RESOURCE, t.toString());
         }
     }
 

@@ -3,6 +3,8 @@ package com.esdllm.common;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 
 /**
  * 按 HTTP 语义把<b>本地文件</b>喂给客户端时，两个出口共用的一小组工具。
@@ -121,6 +123,39 @@ public final class HttpFileSupport {
             sb.append(c < 128 && c > 31 && c != '"' && c != '\\' ? c : '_');
         }
         return sb.toString();
+    }
+
+    /**
+     * 拼 {@code Content-Disposition} 头：<b>同时</b>给 ASCII 回退和 UTF-8 真名。
+     *
+     * <p>为什么两个都要（这就是"文件名改不动"的真正原因）：
+     * <ul>
+     *   <li>只发 {@code filename=}：中文主播名会被 {@link #safeAsciiName} 打成下划线，
+     *       用户下到的是 {@code ______-20261120-153000.mp4} —— 看着像"改名没生效"；</li>
+     *   <li>只发 {@code filename*=}：不认 RFC 5987 的老客户端会退化成 URL 最后一段。</li>
+     * </ul>
+     * 按 RFC 6266 两个都写、{@code filename*} 放后面，支持它的客户端优先用后者。
+     *
+     * @param attachment {@code true} = 下载（{@code attachment}），{@code false} = 在线播放
+     */
+    public static String contentDisposition(String name, boolean attachment) {
+        return (attachment ? "attachment" : "inline")
+                + "; filename=\"" + safeAsciiName(name) + "\""
+                + "; filename*=UTF-8''" + rfc5987(name);
+    }
+
+    /**
+     * RFC 5987 的百分号编码。
+     *
+     * <p>⚠️ {@link URLEncoder} 是 <b>form 编码</b>不是 URL 编码：空格会变成 {@code +}
+     * —— 在头里 {@code +} 就是字面的加号，必须换回 {@code %20}。
+     */
+    private static String rfc5987(String name) {
+        String raw = name == null ? "" : name;
+        return URLEncoder.encode(raw, StandardCharsets.UTF_8)
+                .replace("+", "%20")
+                .replace("*", "%2A")
+                .replace("%7E", "~");
     }
 
     /**

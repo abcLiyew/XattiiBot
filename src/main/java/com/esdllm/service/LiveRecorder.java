@@ -65,6 +65,18 @@ public class LiveRecorder {
     private static final String RW_TIMEOUT_MICROS = "15000000";
 
     /**
+     * 实时预览的切片时长（秒）。延迟 ≈ {@code HLS_SEGMENT_SECONDS × HLS_LIST_SIZE}，
+     * 但播放器通常只滞后 2~3 片 ⇒ 实测 6~12 秒。
+     */
+    private static final int HLS_SEGMENT_SECONDS = 2;
+
+    /**
+     * 实时预览保留多少个切片。别调大：这是<b>滚动窗口</b>，
+     * 每个切片都占磁盘，且 {@code delete_segments} 只保证窗口内可播（窗口外已被删，播放器会 404）。
+     */
+    private static final int HLS_LIST_SIZE = 6;
+
+    /**
      * 等待进程退出时，在"时长上限"之外额外给的宽限（秒）。
      *
      * <p>ffmpeg 到了 {@code -t} 之后还要 flush、写文件尾，不会瞬间退出。
@@ -210,6 +222,35 @@ public class LiveRecorder {
      * @param limitSeconds 本段最长录制秒数（上层按"单场上限 - 已录"算出来）
      */
     public List<String> recordCommand(String ffmpeg, String url, Path out, long limitSeconds) {
+        return recordCommand(ffmpeg, url, out, limitSeconds, null);
+    }
+
+    /**
+     * 录制命令（可选<b>第二路输出 HLS</b>，给网页做"边录边看"）。
+     *
+     * <p>为什么要第二路：录制用的是 {@code -f flv}，而 flv 的索引（moov）在文件末尾 ——
+     * <b>没收尾的文件根本没法播</b>，所以"录制中可预览"只能靠边录边产出<b>切片</b>。
+     * HLS 就是为这件事设计的：每 2 秒一个 {@code .ts}、外加一个不断更新的 {@code index.m3u8}，
+     * 播放器轮询索引就能跟着录制的尾巴走（延迟 ≈ 切片时长 × 列表长度）。
+     *
+     * <p><b>为什么能"零成本"</b>：第二路仍是 {@code -c copy}，不重编码 ——
+     * 只是把同一份码流多封装一次成 MPEG-TS，CPU 近似为 0；磁盘靠
+     * {@code delete_segments} 只留最近 {@code hls_list_size} 片（≈12 秒），增量可忽略。
+     *
+     * <p>⚠️ 两个必须重复写的选项：
+     * <ul>
+     *   <li>{@code -c copy}：它是<b>输出选项</b>，只作用于紧随其后的那个输出 ——
+     *       第二路不写就变成默认编码（4 核机上会直接把录制拖垮）；</li>
+     *   <li>{@code -t}：同上，不写的话第二路会一直跑到流断（第一路的 {@code -t} 管不着它）。</li>
+     * </ul>
+     *
+     * <p>⚠️ {@code omit_endlist}：录制中不能让 m3u8 出现 {@code #EXT-X-ENDLIST}，
+     * 否则播放器会当成"已完结"而停止刷新列表，画面就卡在第一次加载的那几秒。
+     *
+     * @param previewDir 非 {@code null} ⇒ 额外写 HLS 到这个目录（调用方须先建好目录）；
+     *                   {@code null} ⇒ 只录 flv（与老行为一致，便于回退）
+     */
+    public List<String> recordCommand(String ffmpeg, String url, Path out, long limitSeconds, Path previewDir) {
         List<String> cmd = new ArrayList<>();
         cmd.add(ffmpeg);
         cmd.add("-hide_banner");
@@ -235,6 +276,7 @@ public class LiveRecorder {
         cmd.add("5");
         cmd.add("-i");
         cmd.add(url);
+        // —— 输出 1：存档 flv（到点或流断即收工）——
         cmd.add("-t");
         cmd.add(String.valueOf(Math.max(1, limitSeconds)));
         cmd.add("-c");
@@ -242,6 +284,24 @@ public class LiveRecorder {
         cmd.add("-f");
         cmd.add("flv");
         cmd.add(out.toString());
+        if (previewDir != null) {
+            // —— 输出 2：实时预览 HLS（`-c copy` 与 `-t` 都必须重写，见上）——
+            cmd.add("-t");
+            cmd.add(String.valueOf(Math.max(1, limitSeconds)));
+            cmd.add("-c");
+            cmd.add("copy");
+            cmd.add("-f");
+            cmd.add("hls");
+            cmd.add("-hls_time");
+            cmd.add(String.valueOf(HLS_SEGMENT_SECONDS));
+            cmd.add("-hls_list_size");
+            cmd.add(String.valueOf(HLS_LIST_SIZE));
+            cmd.add("-hls_flags");
+            cmd.add("delete_segments+independent_segments+omit_endlist");
+            cmd.add("-hls_segment_filename");
+            cmd.add(previewDir.resolve("seg%05d.ts").toString());
+            cmd.add(previewDir.resolve("index.m3u8").toString());
+        }
         return cmd;
     }
 

@@ -106,6 +106,12 @@ public class LiveRecordServiceImpl implements LiveRecordService {
     private static final DateTimeFormatter STAMP =
             DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").withZone(ZoneId.systemDefault());
 
+    /** 交付文件名里「主播名」最多保留多少字（中文 3 字节，见 {@link #suggestedFileName} 的长度账） */
+    private static final int MAX_NAME_CHARS = 20;
+
+    /** 交付文件名里「直播标题」最多保留多少字。B 站标题经常五六十字，不截会顶破文件名上限 */
+    private static final int MAX_TITLE_CHARS = 30;
+
     @Resource
     private LiveRecordSubMapper subMapper;
     @Resource
@@ -579,8 +585,10 @@ public class LiveRecordServiceImpl implements LiveRecordService {
 
                 Path part = session.dir.resolve(String.format("part%03d.flv", ++partIndex));
                 session.currentPart = part;
+                // 实时预览目录：每段一个（续录会新开 p001、p002…），网页取"索引最新"的那个
+                Path previewDir = prepPreviewDir(session, partIndex);
                 LiveRecorder.Result result = recorder.run(
-                        recorder.recordCommand(ffmpeg, url, part, remainingSeconds),
+                        recorder.recordCommand(ffmpeg, url, part, remainingSeconds, previewDir),
                         session.dir.resolve("ffmpeg.log"), part, remainingSeconds, p -> session.process = p);
                 session.process = null;
 
@@ -642,6 +650,10 @@ public class LiveRecordServiceImpl implements LiveRecordService {
     /** 收尾：合并分片、读时长、登记入库。 */
     private void finish(Session session) {
         LiveRecordFile row = session.row;
+        // 实时预览的切片只服务于"录制中"，收尾第一件事就是删掉：
+        // ① 它不是这一场的交付物（回放走 out.flv → 取用时转 mp4）；
+        // ② 下面的 dirSize 会把切片算进 sizeBytes，让"这一场多大"虚高几十 MB。
+        deleteRecursively(session.dir.resolve("preview"));
         Path main = null;
         boolean merged = true;
         if (session.parts.size() == 1) {
@@ -1241,8 +1253,27 @@ public class LiveRecordServiceImpl implements LiveRecordService {
                         .append("或把 ").append(LoadDSConfig.KEY_BILI_RECORD_DELIVERY_MODE)
                         .append(" 设为 url。");
             } else if ("url".equals(delivery.mode())) {
-                hint.append("NapCat 拉不到这个地址 ⇒ 基址选错了。用「录播地址」命令看候选，"
-                        + "然后把正确的那条配到 ").append(LoadDSConfig.KEY_BILI_RECORD_PUBLIC_BASE_URL);
+                if ("接口无响应".equals(outcome)) {
+                    // ⚠️ 别再一口咬定"拉不到"：常见的是**慢到超时**而不是不可达。
+                    // NapCat 的 upload 是同步的（要先把这个 URL 拉下来才回），
+                    // 基址走公网时大文件能慢几十倍，于是这边等不到响应 —— 而文件往往过一会儿
+                    // 还是会被 NapCat 拉完并发出去（2026-11-20 实况：配了公网域名后正是这样）。
+                    hint.append("它的意思是：NapCat 没在上限时间内回应 —— 而它是**先把文件拉下来**才回的。\n")
+                            .append("三种常见原因，别混：\n")
+                            .append("  · 基址是公网域名 ⇒ 绕一圈公网，大文件慢到超时（文件常常过一会儿还是会到）\n")
+                            .append("  · **宿主防火墙挡了容器** ⇒ NapCat 日志里是 ")
+                            .append("ConnectTimeoutError，而你在**宿主上** curl 同一个地址却是通的")
+                            .append("（INPUT 链对 lo 放行），最容易误判成\"慢\"或\"基址错\"\n")
+                            .append("  · 基址网段不对（容器在别的 docker 网络）⇒ 那才是真的不可达\n")
+                            .append("自查：发「录播地址」看候选。NapCat 与机器人**同机**时应该配 ")
+                            .append(fileServer.port() > 0
+                                    ? "http://172.17.0.1:" + fileServer.port() + "（docker 网桥，毫秒级）"
+                                    : "docker 网桥地址")
+                            .append("；仍超时就查宿主 iptables 有没有放行 docker0 → 该端口。");
+                } else {
+                    hint.append("NapCat 拒绝了这个地址。用「录播地址」命令看候选，"
+                            + "然后把正确的那条配到 ").append(LoadDSConfig.KEY_BILI_RECORD_PUBLIC_BASE_URL);
+                }
             }
             return hint.toString();
         }
@@ -1417,15 +1448,47 @@ public class LiveRecordServiceImpl implements LiveRecordService {
         return suggestedFileName(row, mp4);
     }
 
+    /**
+     * 交付时用的文件名：{@code 主播名-标题-开始时间.mp4}。
+     *
+     * <p>为什么不是 {@code fid}：文件名是用户唯一能对上"这是哪一场"的线索，
+     * 而 {@code #3} 这种编号一离开列表就没有意义了；主播名 + 标题 + 时间，在聊天记录和
+     * 下载目录里都还认得出来。
+     *
+     * <p>⚠️ 时间用 {@link #STAMP}（{@code yyyyMMdd-HHmmss}）：冒号在 Windows 上是非法文件名
+     * 字符、空格在命令行与 URL 里要转义 —— 而这个名字要同时交给浏览器和 NapCat。
+     *
+     * <p>⚠️ 长度账：中文一个字 3 字节，文件系统上限 255 字节。主播名限 20 字、标题限 30 字，
+     * 最坏 150 字节 + 时间戳 + 后缀仍有余量；不截断的话，一个 60 字的直播标题会直接把名字顶破。
+     *
+     * <p>标题为空（B 站偶尔不返回）时退回两段式 {@code 主播-时间}，避免出现 {@code 主播--时间}。
+     */
     @Override
     public String suggestedFileName(LiveRecordFile row, boolean mp4) {
         String ext = mp4 ? ".mp4" : ".flv";
         String who = row.getUname() == null || row.getUname().isBlank()
                 ? "房间" + row.getRoomId()
-                : row.getUname();
+                : row.getUname().trim();
         String stamp = row.getStartTime() == null ? "unknown"
                 : STAMP.format(Instant.ofEpochMilli(row.getStartTime()));
-        return sanitizeFileName(who + "-" + stamp + "-" + row.getFid() + ext);
+
+        StringBuilder sb = new StringBuilder(sanitizeFileName(shorten(who, MAX_NAME_CHARS)));
+        String title = row.getTitle() == null ? "" : row.getTitle().trim();
+        // 标题与主播名相同就去重：不少小主播直接把昵称当直播间标题，
+        // 照抄会得到「头像锐评，玻璃心别进-头像锐评，玻璃心别进-20261120-153000.mp4」这种名字
+        boolean titleWorthShowing = !title.isEmpty() && !title.equalsIgnoreCase(who.trim());
+        if (titleWorthShowing) {
+            // 换行/连续空白先压平：浏览器会把它们折叠、NapCat 会原样保留，
+            // 不统一的话两端看到的文件名不是一个东西
+            title = title.replaceAll("\\s+", " ");
+            sb.append('-').append(sanitizeFileName(shorten(title, MAX_TITLE_CHARS)));
+        }
+        return sb.append('-').append(stamp).append(ext).toString();
+    }
+
+    /** 超长就硬截断。<b>不加省略号</b>：它在某些客户端/文件系统里会变成乱码方块。 */
+    private static String shorten(String s, int max) {
+        return s.length() <= max ? s : s.substring(0, max);
     }
 
     /** 文件名里的路径分隔符与控制字符必须去掉，否则 NapCat 那边会当成路径处理。 */
@@ -1468,6 +1531,54 @@ public class LiveRecordServiceImpl implements LiveRecordService {
     /** 一场录制的目录：{@code <根>/<roomId>/<fid>}。 */
     private Path sessionDir(LiveRecordFile row) {
         return recordRoot().resolve(String.valueOf(row.getRoomId())).resolve(String.valueOf(row.getFid()));
+    }
+
+    @Override
+    public Path previewDirOf(LiveRecordFile row) {
+        if (row == null) {
+            return null;
+        }
+        Path preview = sessionDir(row).resolve("preview");
+        if (!Files.isDirectory(preview)) {
+            return null;
+        }
+        try (Stream<Path> list = Files.list(preview)) {
+            return list.filter(Files::isDirectory)
+                    // 只认"索引已生成"的：目录可能刚 mkdir 出来、ffmpeg 还没写第一个切片，
+                    // 那种目录拿去给播放器只会得到一个 500
+                    .filter(p -> Files.isRegularFile(p.resolve("index.m3u8")))
+                    // m3u8 每 2 秒被 ffmpeg 重写一次 ⇒ mtime 最新的就是"此刻正在写的那一段"
+                    .max(Comparator.comparingLong(LiveRecordServiceImpl::previewMtime))
+                    .orElse(null);
+        } catch (IOException e) {
+            log.debug("列实时预览目录失败：{}", e.toString());
+            return null;
+        }
+    }
+
+    private static long previewMtime(Path dir) {
+        try {
+            return Files.getLastModifiedTime(dir.resolve("index.m3u8")).toMillis();
+        } catch (IOException e) {
+            return 0L;
+        }
+    }
+
+    /**
+     * 建本段的实时预览目录；<b>失败返回 {@code null} ⇒ 这一段不生成实时流</b>。
+     *
+     * <p>刻意把异常吞掉：实时预览是锦上添花，磁盘满 / 权限不对时让它安静失效，
+     * 也绝不能让"多出来的一路输出"把整场录制拖死。
+     */
+    private Path prepPreviewDir(Session session, int partIndex) {
+        try {
+            Path dir = session.dir.resolve("preview").resolve(String.format("p%03d", partIndex));
+            Files.createDirectories(dir);
+            return dir;
+        } catch (Exception e) {
+            log.warn("建实时预览目录失败，本段不提供实时画面（录制不受影响）：{}", e.toString());
+            return null;
+        }
     }
 
     /** 把库里存的相对路径还原成绝对路径；越界（不是录播根下的）返回 {@code null}。 */

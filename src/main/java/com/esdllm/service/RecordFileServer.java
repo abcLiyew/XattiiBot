@@ -103,6 +103,16 @@ public class RecordFileServer {
     @Value("${shiro.ws.client.url:}")
     private String napCatWsUrl;
 
+    /**
+     * Tomcat 自己的监听端口（{@code server.port}，本项目 2233）。
+     *
+     * <p>只用来做一件事：<b>别跟它抢端口</b>。本类的 {@code HttpServer} 与 Tomcat 是两个
+     * 独立 socket，同号时先绑的那个赢、后者直接起不来（Spring Boot 会以
+     * {@code Port 2233 was already in use} 中止整个进程）。2026-11-20 生产事故就是这个。
+     */
+    @Value("${server.port:8080}")
+    private int webPort;
+
     private final SecureRandom random = new SecureRandom();
 
     /** token → 待下载文件。**只有被登记过的才有**，这是安全模型的地基 */
@@ -134,6 +144,20 @@ public class RecordFileServer {
     public void start() {
         int port = loadDSConfig.intOf(LoadDSConfig.KEY_BILI_RECORD_SERVE_PORT,
                 LoadDSConfig.DEFAULT_RECORD_SERVE_PORT);
+        if (port == webPort) {
+            // 走到这里说明「录播文件服务端口」被配成了 HTTP 端口（或默认值又被人改错）。
+            // 不纠的话：本方法在 @PostConstruct 里、比 Tomcat 早，先占住端口，
+            // 接着 Tomcat 绑同号失败 ⇒ 整个机器人起不来，而日志最醒目的只有"端口占用"，
+            // 真正的原因（是我们自己抢的）藏在上面一行"录播文件服务已启动"里。
+            int fallback = LoadDSConfig.DEFAULT_RECORD_SERVE_PORT == webPort
+                    ? 0 : LoadDSConfig.DEFAULT_RECORD_SERVE_PORT;
+            log.error("录播文件服务端口 {} 与 HTTP 服务端口（server.port）相同 —— 两者会互相抢端口"
+                            + "并导致启动失败。本次改用 {}（{} 请修正 {}）",
+                    port, fallback == 0 ? "随机端口" : String.valueOf(fallback),
+                    fallback == 0 ? "随机端口下 NapCat 多半取不到文件，" : "下次重启即按新端口监听，",
+                    LoadDSConfig.KEY_BILI_RECORD_SERVE_PORT);
+            port = fallback;
+        }
         String bind = loadDSConfig.stringOf(LoadDSConfig.KEY_BILI_RECORD_SERVE_BIND,
                 LoadDSConfig.DEFAULT_RECORD_SERVE_BIND);
         try {
@@ -410,6 +434,23 @@ public class RecordFileServer {
         String chosen = baseUrl();
         sb.append("\n  当前采用：").append(chosen == null ? "(无，下载将退回本地路径模式)" : chosen);
         log.info(sb.toString());
+
+        // 显式配了"不是本机候选"的基址（公网域名 / 公网 IP）而 NapCat 就在本机 ⇒
+        // 它取文件会绕一圈公网（回到自己的公网 IP），受出口带宽限制，大文件能慢几十倍。
+        // 表现不是"拉不到"，而是 NapCat 迟迟不回、这边报"接口无响应"，文件过一会儿却照样发出去。
+        // 2026-11-20 生产上就是这么踩的（配了 bili-file.kitties.cn，hairpin 实测 0.9s vs 网桥 3ms）。
+        if (chosen != null && napCatLooksLocal() && !isLocalCandidate(chosen)) {
+            log.warn("⚠️ 交付基址是外部地址（{}），而 NapCat 看起来就在本机 —— 它取文件要绕一圈公网，"
+                            + "大文件很可能慢到超时（症状是「发送失败：接口无响应」但文件稍后仍会到）。"
+                            + "同机场景建议清空 {}（自动选 docker 网桥）或直接配 http://172.17.0.1:{}",
+                    chosen, LoadDSConfig.KEY_BILI_RECORD_PUBLIC_BASE_URL, actualPort);
+        }
+    }
+
+    /** 这个基址的 host 是不是我们推断出来的本机候选之一（是 ⇒ NapCat 走内网就能到）。 */
+    private boolean isLocalCandidate(String url) {
+        String host = hostOf(url);
+        return host != null && candidateAddresses(napCatLooksLocal()).contains(host);
     }
 
     /** 供命令回显：当前基址 + 候选清单（人排障用）。 */
@@ -520,7 +561,7 @@ public class RecordFileServer {
         headers.set("Content-Type", HttpFileSupport.contentType(entry.name()));
         headers.set("Accept-Ranges", "bytes");
         headers.set("Content-Disposition",
-                "attachment; filename=\"" + HttpFileSupport.safeAsciiName(entry.name()) + "\"");
+                HttpFileSupport.contentDisposition(entry.name(), true));
         if (range.partial()) {
             headers.set("Content-Range", "bytes " + start + "-" + end + "/" + total);
             exchange.sendResponseHeaders(206, length);

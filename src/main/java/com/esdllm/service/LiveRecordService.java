@@ -152,7 +152,7 @@ public interface LiveRecordService {
     Path playableFile(Long fid) throws IOException;
 
     /**
-     * 给用户看的文件名（{@code 主播-开始时间-fid.mp4}）。
+     * 给用户看的文件名（{@code 主播名-标题-开始时间.mp4}）。
      *
      * <p>放在服务里而不是让每个出口各拼一遍：QQ 发文件和浏览器下载用的是同一个名字，
      * 两处各写一份必然有一天会分叉（而文件名是用户唯一能对上"这是哪一场"的线索）。
@@ -160,10 +160,28 @@ public interface LiveRecordService {
      * <p>⚠️ 结果已去掉路径分隔符与控制字符 —— 它要进 {@code Content-Disposition} 头、
      * 也要交给 NapCat 当落盘文件名。
      *
+     * <p>⚠️ 名字里有中文，所以出口必须用
+     * {@link com.esdllm.common.HttpFileSupport#contentDisposition} 拼头（同时写
+     * {@code filename=} 与 {@code filename*=}）；只写前者的话，浏览器会把中文全换成下划线。
+     *
      * @param row  录播记录
      * @param mp4  扩展名用 mp4 还是 flv
      */
     String suggestedFileName(LiveRecordFile row, boolean mp4);
+
+    /**
+     * 取一场<b>正在录制</b>的实时预览目录（里面是 {@code index.m3u8} + 若干 {@code .ts}）。
+     *
+     * <p>为什么需要它：录制中的 flv 没有索引、<b>没法播</b>，所以录制时另开了一路 HLS
+     * （见 {@code LiveRecorder#recordCommand} 的第二输出）。这个方法是网页取那一路的入口。
+     *
+     * <p>一场长直播会因为"地址过期重连续录"拆成多段，每段有自己的预览目录
+     * （{@code preview/p001}、{@code p002}…），这里返回<b>索引文件最新</b>的那个
+     * —— 也就是此刻 ffmpeg 正在写的那一段。
+     *
+     * @return 没有实时预览（没在录 / 录制已结束 / 预览目录被清）时返回 {@code null}
+     */
+    Path previewDirOf(LiveRecordFile row);
 
     /** 设置/取消保留标记（保留的既不参与压缩也不参与淘汰）。 */
     boolean setKeep(Long fid, boolean keep);    /** 删除一场录播（连目录一起删）。正在录制的拒绝。 */

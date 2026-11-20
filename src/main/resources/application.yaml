@@ -8,6 +8,12 @@ shiro:
     #    取值优先级：命令行参数 > 环境变量 SHIRO_ACCESS_TOKEN > 这里的空串。
     #    线上 start.sh 本来就是用命令行传的（--shiro.ws.access-token=...），不受影响。
     access-token: "${SHIRO_ACCESS_TOKEN:}"
+    # action 的等待上限（毫秒）。默认 10 秒对"发大文件"完全不够：
+    # uploadGroupFile 是同步的 —— NapCat 要把整个文件拉下来、再传到 QQ 服务器，才回这个 action。
+    # 几百 MB 的录播必然超过 10 秒，于是这边判"接口无响应"、而文件其实随后就发出去了
+    # （2026-11-20 实况：反复报失败，但用户紧接着就收到视频）。
+    # 代价：只在 NapCat 真的不回时才等这么久，正常请求仍是毫秒级返回。
+    timeout: 120000
     server:
       enable: false
       url: "/ws/demo"

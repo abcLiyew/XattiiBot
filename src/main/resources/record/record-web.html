@@ -103,6 +103,9 @@
   </div>
 </div>
 
+<!-- HLS 播放库：Safari 原生支持 m3u8，用不到它；Chrome/Edge 必须靠它。
+     打进 jar 由 /record/hls.js 提供，不走公网 CDN（时通时不通，最难解释） -->
+<script src="/record/hls.js"></script>
 <script>
 (function () {
   'use strict';
@@ -116,12 +119,20 @@
   var page = 1;
   var current = null;
   var player = null;
+  var hls = null;   // hls.js 实例（实时预览用；Safari 原生播放时保持 null）
 
   var $ = function (id) { return document.getElementById(id); };
 
   /* ---------------- 管理码（只存本机，不上传） ---------------- */
   function manageToken() {
-    try { return localStorage.getItem(MANAGE_KEY) || ''; } catch (e) { return ''; }
+    try {
+      var v = localStorage.getItem(MANAGE_KEY) || '';
+      if (v) return v;
+    } catch (e) {}
+    // 用「管理台链接」（/record/<管理码>）打开时，URL 里的令牌本身就是管理码。
+    // 不自动沿用的话，页面会因为 current.admin 而显示「保留/删除」按钮，
+    // 点下去却 403（服务端只认请求头里的码）—— 按钮可见就必须可用。
+    return (current && current.admin) ? TOKEN : '';
   }
   function setManageToken(v) {
     try { v ? localStorage.setItem(MANAGE_KEY, v) : localStorage.removeItem(MANAGE_KEY); } catch (e) {}
@@ -185,6 +196,15 @@
     h.push('<div class="card" data-fid="' + it.fid + '">');
     h.push('<div class="row1"><span class="who">' + esc(it.uname) + '</span>');
     h.push('<span class="fid">#' + it.fid + ' · 房间 ' + esc(it.roomId) + '</span></div>');
+    // 全群视图里必须标出归属 —— 否则「这个该不该删」只能靠猜。
+    // 刻意不把群号做成跳转链接：那需要服务端把各群的网页令牌吐给管理台，
+    // 等于把"别的群的回放链接"散给管理员（管理码本来就能看全部，没必要再发令牌出去）
+    if (current && current.admin) {
+      var gs = it.groups || [];
+      h.push('<div class="meta"><span>'
+        + (gs.length ? '归属群 ' + gs.join('、') : '归属群：无（该房间已没有订阅，只剩历史文件）')
+        + '</span></div>');
+    }
     if (it.title) h.push('<div class="title">' + esc(it.title) + '</div>');
     h.push('<div class="meta"><span>' + fmtTime(it.startTime) + '</span>');
     h.push('<span>时长 ' + fmtDuration(it.durationMs) + '</span>');
@@ -194,6 +214,11 @@
     if (it.playable) {
       h.push('<button class="primary" data-act="play">▶ 播放</button>');
       h.push('<button data-act="download">下载</button>');
+    }
+    // 实时：只有"正在录 + 切片已就绪"才给按钮。它在录但还没写出第一个 m3u8 时
+    // 只显示上面的「● 录制中」徽章 —— 点下去只会得到"还没有实时画面"
+    if (it.live) {
+      h.push('<button class="primary" data-act="live">▶ 实时</button>');
     }
     if (canManage() && String(it.status).toUpperCase() !== 'RECORDING') {
       h.push('<button data-act="keep">' + (it.keep ? '取消保留' : '标记保留') + '</button>');
@@ -261,12 +286,14 @@
   }
 
   function stopPlayer() {
+    if (hls) { try { hls.destroy(); } catch (e) {} hls = null; }
     if (player) { try { player.pause(); } catch (e) {} player = null; }
   }
 
   /* ---------------- 动作 ---------------- */
   function onAct(act, fid, card, btn) {
     if (act === 'play') return doPlay(fid, card, btn);
+    if (act === 'live') return doLive(fid, card, btn);
     if (act === 'download') {
       location.href = API + '/download/' + fid;
       return;
@@ -299,6 +326,60 @@
         btn.disabled = false;
         btn.textContent = '▶ 播放';
       });
+  }
+
+  /**
+   * 实时预览：播正在录的这一场的 HLS 切片流。
+   *
+   * 和「播放」的区别：播放要先 flv→mp4 转壳（几秒到十几秒，而且录制中根本转不了），
+   * 实时是直接播 ffmpeg 边录边切出来的 ts 片段，延迟约 10 秒。
+   * 注意它只有很短的窗口（服务端只留最近 6 个切片），所以拖不回更早的内容。
+   */
+  function doLive(fid, card, btn) {
+    var video = card.querySelector('video');
+    stopPlayer();
+    var url = '/record/live/' + encodeURIComponent(TOKEN) + '/' + fid + '/index.m3u8';
+    video.style.display = 'block';
+    video.removeAttribute('src');
+    hint('实时画面比主播慢 10 秒左右（由切片窗口决定）。关掉这块卡片或刷新页面即停止，不会一直占服务器带宽。');
+
+    if (window.Hls && window.Hls.isSupported()) {
+      hls = new Hls({ liveSyncDurationCount: 3 });
+      hls.loadSource(url);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, function () {
+        var go = video.play();
+        if (go && go.catch) go.catch(function () { hint('浏览器拦下了自动播放，点一下播放器上的三角即可。'); });
+      });
+      hls.on(Hls.Events.ERROR, function (evt, data) {
+        if (!data || !data.fatal) return;
+        // 网络类错误（切片刚好滚出窗口、手机切后台）重拉即可；媒体类错误让 hls 自己恢复。
+        // 真正救不回来的才提示 —— 而且要说清"录制没受影响"，否则会以为录废了。
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          // 404 = 这一场真结束了（服务端收尾时会删掉预览目录）。
+          // 不单独判的话会无限重试，用户看到的是一个永远转圈的播放器
+          var code = data.response && data.response.code;
+          if (code === 404) {
+            hint('这一场已经录完，刷新页面即可在列表里看回放。');
+            stopPlayer();
+            return;
+          }
+          hls.startLoad();
+          return;
+        }
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR) { hls.recoverMediaError(); return; }
+        hint('实时画面中断：' + (data.details || '未知原因') + '（录制仍在继续，录完可在列表里看回放）', true);
+        stopPlayer();
+      });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      // Safari / iOS：原生支持 m3u8，不需要 hls.js
+      video.src = url;
+      player = video;
+      var go2 = video.play();
+      if (go2 && go2.catch) go2.catch(function () {});
+    } else {
+      hint('这个浏览器不支持 HLS 实时播放（播放库没加载成功）。录制仍在继续，录完可以正常播放。', true);
+    }
   }
 
   function manage(path, cb) {

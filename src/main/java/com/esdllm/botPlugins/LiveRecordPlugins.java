@@ -26,8 +26,11 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -44,9 +47,13 @@ import java.util.regex.Pattern;
  * <pre>
  * ── 订阅（群内管理员；决定"录谁"，影响磁盘与带宽）
  * 录播订阅 1024                加订阅（自动开录）—— 记到<b>本群</b>
- * 录播订阅列表                 看本群盯了哪些房间（私聊里则是全部）
+ * 录播订阅列表                 看本群盯了哪些房间（⚠️ 私聊里<b>只</b>列全局订阅，不是全部）
  * 录播取消订阅 1024            取消订阅（已录好的文件保留）
  * 录播开关 1024 关             暂停/恢复某个订阅的自动录制
+ *
+ * ── 跨群订阅（仅所有者；"这台机器在替哪些群盯谁"）
+ * 录播订阅列表 全部            按群分组的全量总览（含全局订阅、暂停、录制中）
+ * 录播取消订阅 <群号> <房间号>  只删指定群那一行（群号写 0 = 全局订阅）
  *
  * ── 取用（群内管理员）
  * 录播列表 [页码]              列已录好的场次（编号 = fid）
@@ -131,6 +138,31 @@ public class LiveRecordPlugins {
     private static final String CMD_SUB_DEL = "^" + CMD_PREFIX + "录播取消订阅\\s+" + ID + "\\s*$";
     private static final String CMD_SUB_SWITCH = "^" + CMD_PREFIX + "录播开关\\s+" + ID + "\\s+\\S+\\s*$";
 
+    /**
+     * 订阅<b>总览</b>（跨群）：`录播订阅列表 全部`。
+     *
+     * <p>为什么需要它：{@link #CMD_SUB_LIST} 在私聊里只能看到"全局订阅"
+     * （{@code listSubs(null)} 查的是 {@code group_id IS NULL}），
+     * 于是"每个群各订了什么"在聊天里根本没有出口 —— 只能进每个群挨个发一次，或者去改库。
+     *
+     * <p>与 {@link #CMD_SUB_LIST} 靠"末尾是否带参数"互斥：那条要求直接到行尾。
+     */
+    private static final String CMD_SUB_LIST_ALL =
+            "^" + CMD_PREFIX + "录播订阅列表\\s+(?:全部|所有|all)\\s*$";
+
+    /**
+     * <b>跨群</b>取消订阅：`录播取消订阅 <群号> <房间号>`（群号写 {@code 0} = 全局订阅那一行）。
+     *
+     * <p>为什么需要它：{@link #CMD_SUB_DEL} 按<b>当前会话的群</b>定位，私聊里
+     * {@code event.getGroupId()} 是 {@code null} ⇒ 它只能删全局订阅，删不掉某个群的。
+     *
+     * <p>与 {@link #CMD_SUB_DEL} 靠"房间号后面还有没有第二个数字"互斥（那条 {@code \s*$} 接不住）。
+     * 语义是<b>只删指定的那一行</b>，不是"把这个房间全删了" ——
+     * 同一房间被多个群订阅时，删一行不影响其他群，也不影响正在录的那一路。
+     */
+    private static final String CMD_SUB_DEL_SCOPED =
+            "^" + CMD_PREFIX + "录播取消订阅\\s+" + ID + "\\s+" + ID + "\\s*$";
+
     // ── 取用（群内管理员）
     private static final String CMD_FILE_LIST = "^" + CMD_PREFIX + "录播列表(?:\\s+" + ID + ")?\\s*$";
     private static final String CMD_FILE_GET = "^" + CMD_PREFIX + "录播下载\\s+" + ID + "\\s*$";
@@ -175,6 +207,15 @@ public class LiveRecordPlugins {
 
     /** 一页显示多少场 */
     private static final int PAGE_SIZE = 8;
+
+    /**
+     * 「订阅总览」的字符上限（超了就截断并说明）。
+     *
+     * <p>订阅数没有分页 —— 它是"运维一眼看全"的面板，翻页反而难对账。
+     * 但 QQ 单条消息装不下几百行，拼一条发不出去的消息比截断更糟。
+     * 3000 字大约 60 行订阅，够覆盖实际规模（当前个位数群）。
+     */
+    private static final int MAX_LIST_CHARS = 3000;
 
     private static final DateTimeFormatter STAMP =
             DateTimeFormatter.ofPattern("MM-dd HH:mm").withZone(ZoneId.systemDefault());
@@ -285,11 +326,159 @@ public class LiveRecordPlugins {
         });
     }
 
+    /**
+     * 订阅<b>总览</b>（跨群）：`录播订阅列表 全部`（仅所有者）。
+     *
+     * <p>它回答的是运维视角的那一问：<b>这台机器此刻在为哪些群、盯哪些房间</b>。
+     * 按群分组展示（全局订阅排最前），每行带"开/暂停"与"是否在录"，
+     * 末尾给出跨群取消的写法 —— 否则看到问题也改不动，等于只报不看。
+     *
+     * <p><b>为什么是 OWNER 档</b>：这份列表把"所有群在盯谁"一次摊开，
+     * 信息面本身就是全局的；而且它天然是"要去动别人的订阅"的前置步骤，
+     * 与 {@link #subDelScoped} 同一档才自洽。
+     */
+    @AnyMessageHandler
+    @MessageHandlerFilter(cmd = CMD_SUB_LIST_ALL, at = AtEnum.BOTH)
+    public void subListAll(Bot bot, AnyMessageEvent event) {
+        guard(bot, event, Level.OWNER, () -> {
+            List<LiveRecordSub> subs = new ArrayList<>(liveRecordService.listSubs());
+            if (subs.isEmpty()) {
+                send(bot, event, "还没有任何录播订阅（所有群都没有）。");
+                return;
+            }
+            send(bot, event, renderSubOverview(subs));
+        });
+    }
+
+    /**
+     * 订阅总览的渲染。
+     *
+     * <p>抽成独立方法（不直接 in handler）是为了它能被单独验：分组边界、排序键、
+     * 统计口径、超长截断这几件事全是纯字符串逻辑，用假数据跑一遍就能看见，
+     * 而"塞在 handler 里"就只能靠人肉读代码 + 群里真发一条。
+     */
+    private String renderSubOverview(List<LiveRecordSub> subs) {
+        // 排序：全局订阅（groupId=null）排最前，其余按群号升序，群内按房间号升序。
+        // 用"先比 null 后比群号"两段比较而不是把 null 当 0 —— 群号理论上可能是 0 位数字，
+        // 真混进来会跟全局订阅挤在一起。
+        subs.sort(Comparator
+                .comparingInt((LiveRecordSub s) -> s.getGroupId() == null ? 0 : 1)
+                .thenComparingLong(s -> s.getGroupId() == null ? 0L : s.getGroupId())
+                .thenComparing(LiveRecordSub::getRoomId,
+                        Comparator.nullsLast(Comparator.naturalOrder())));
+
+        int groups = 0;
+        int paused = 0;
+        // ⚠️ 按<b>房间</b>去重，不是按行数：同一房间被 3 个群订阅就是 3 行，
+        // 但录制只有 1 路（tick 按 room_id 去重）。按行数统计会报出"录制中 3 路"这种假话，
+        // 而这恰好是扩容/排障时最容易被信以为真的数字。
+        Set<Long> recordingRooms = new HashSet<>();
+        StringBuilder sb = new StringBuilder();
+        Long currentGroup = null;
+        boolean firstLine = true;
+        for (LiveRecordSub sub : subs) {
+            if (firstLine || !Objects.equals(currentGroup, sub.getGroupId())) {
+                if (!firstLine) {
+                    sb.append("\n");
+                }
+                sb.append(sub.getGroupId() == null
+                        ? "全局订阅（私聊里加的）" : "群 " + sub.getGroupId()).append("：\n");
+                currentGroup = sub.getGroupId();
+                firstLine = false;
+                groups++;
+            }
+            boolean on = Integer.valueOf(1).equals(sub.getAutoRecord());
+            boolean rec = liveRecordService.isRecording(sub.getRoomId());
+            if (!on) {
+                paused++;
+            }
+            if (rec) {
+                recordingRooms.add(sub.getRoomId());
+            }
+            sb.append(on ? "  ● " : "  ○ ").append(sub.getRoomId())
+                    .append("　").append(describe(sub))
+                    .append(on ? "" : "　[已暂停]")
+                    .append(rec ? "　⏺录制中" : "")
+                    .append("\n");
+            // QQ 单条消息装不下几百行；宁可截断并说明，也不要拼一条发不出去的消息
+            if (sb.length() > MAX_LIST_CHARS) {
+                sb.append("…（太长已截断，共 ").append(subs.size()).append(" 条）\n");
+                break;
+            }
+        }
+
+        String head = "录播订阅总览（共 " + subs.size() + " 条 / " + groups + " 个归属 / 暂停 "
+                + paused + " / 录制中 " + recordingRooms.size() + " 路）\n\n";
+        String tail = """
+
+                ● 开录　○ 暂停
+                只停某一个群：录播取消订阅 <群号> <房间号>
+                停全局订阅：　录播取消订阅 0 <房间号>""";
+        return head + sb + tail;
+    }
+
+    /**
+     * <b>跨群</b>取消订阅：`录播取消订阅 <群号> <房间号>`（群号 {@code 0} = 全局订阅，仅所有者）。
+     *
+     * <p>与「录播取消订阅 房间号」的区别只有定位方式：那条定位的是<b>当前群</b>，
+     * 这条明确指定归属群 —— 私聊里才有意义（私聊没有"当前群"这个上下文）。
+     *
+     * <p>⚠️ 会如实说明两件事，因为它们都不是"无感"的：
+     * <ul>
+     *   <li>房间还有别的群订阅 ⇒ 录制与文件都不受影响，只是这个群以后看不到了；</li>
+     *   <li>这是最后一条订阅 ⇒ {@code removeSub} 会<b>掐断</b>正在录的那一路（这一场以中断收尾）。
+     *       所以回显必须把那句话打出来，不能只说"已取消"。</li>
+     * </ul>
+     */
+    @AnyMessageHandler
+    @MessageHandlerFilter(cmd = CMD_SUB_DEL_SCOPED, at = AtEnum.BOTH)
+    public void subDelScoped(Bot bot, AnyMessageEvent event) {
+        guard(bot, event, Level.OWNER, () -> {
+            String raw = argsAfter(body(event.getMessage()), "录播取消订阅");
+            String[] parts = raw.trim().split("\\s+");
+            // 群号要能是 0（= 全局订阅），所以这里不能用 parseId —— 它把 0 判成非法
+            Long rawGroup = parts.length > 0 ? parseGroupToken(parts[0]) : null;
+            Long roomId = parts.length > 1 ? parseId(parts[1]) : null;
+            if (rawGroup == null || roomId == null) {
+                send(bot, event, """
+                        格式：录播取消订阅 <群号> <房间号>
+                        全局订阅的群号写 0（例：录播取消订阅 0 1024）
+                        先发「录播订阅列表 全部」核对群号。""");
+                return;
+            }
+            // 0 = 全局订阅那一行（group_id IS NULL）。用 0 而不是"全部/全局"两个字：
+            // 这条命令的主体是 <群号> <房间号> 两个数字，混进一个中文词会让人以为还有别的写法
+            Long groupId = rawGroup == 0L ? null : rawGroup;
+
+            // 落库之前先记下"现在是不是在录"，落库之后答案会变（最后一条订阅会顺手停录）
+            boolean wasRecording = liveRecordService.isRecording(roomId);
+            boolean ok = liveRecordService.removeSub(roomId, groupId);
+            if (!ok) {
+                send(bot, event, (groupId == null ? "全局订阅" : "群 " + groupId)
+                        + " 没有订阅房间 " + roomId + "。\n发「录播订阅列表 全部」核对群号与房间号。");
+                return;
+            }
+            boolean stillWanted = liveRecordService.isSubscribed(roomId);
+            StringBuilder sb = new StringBuilder("✅ 已取消 ")
+                    .append(groupId == null ? "全局订阅" : "群 " + groupId)
+                    .append(" 对房间 ").append(roomId).append(" 的订阅");
+            if (stillWanted) {
+                sb.append("\n这个房间还有别的订阅 ⇒ 录制照旧，已录/在录的文件仍对订阅它的群可见。");
+            } else if (wasRecording) {
+                sb.append("\n⚠️ 已没有任何群订阅它，正在录的这一路已停下 —— 这一场会按「中断」收尾。");
+            } else {
+                sb.append("\n已没有任何群订阅它，后续不再自动录；已录好的文件都还在（「录播列表」可查）。");
+            }
+            send(bot, event, sb.toString());
+            log.info("跨群取消录播订阅：roomId={}, groupId={}（操作者 {}）",
+                    roomId, groupId, event.getUserId());
+        });
+    }
+
     /** 取消订阅：`录播取消订阅 1024` */
     @AnyMessageHandler
     @MessageHandlerFilter(cmd = CMD_SUB_DEL, at = AtEnum.BOTH)
-    public void subDel(Bot bot, AnyMessageEvent event) {
-        guard(bot, event, Level.GROUP, () -> {
+    public void subDel(Bot bot, AnyMessageEvent event) {        guard(bot, event, Level.GROUP, () -> {
             Long roomId = parseId(argsAfter(body(event.getMessage()), "录播取消订阅"));
             if (roomId == null) {
                 send(bot, event, "格式：录播取消订阅 房间号");
@@ -878,11 +1067,33 @@ public class LiveRecordPlugins {
         });
     }
 
-    private static String manageCodeText(String code) {
-        return "【录播网页管理码】\n" + code
-                + "\n\n用法：打开录播网页 → 点右上角「管理」→ 粘贴这串码。\n"
-                + "有了它就能在网页上改保留标记、删录播（能看全部群，不只是某一个群）。\n"
-                + "⚠️ 别把它发到任何群里 —— 谁拿到谁就有删除权。泄了就发「录播管理码重置」。";
+    /**
+     * 管理码的回复文案。
+     *
+     * <p>⚠️ 这段消息本身就是<b>凭据</b>（码能删任何群的录播、链接打开即全群视图），
+     * 所以调用方一律走私聊 —— 群里发只会回一句"已私聊发给你"。
+     *
+     * <p>为什么要把<b>管理台链接</b>一起给：以前只给一串码，用户得先随便打开一个<b>群</b>链接、
+     * 点右上角「管理」、粘码，而那样看到的仍然<b>只有本群</b>的场次（列表按 URL 里的群令牌过滤）。
+     * 想让"管理码"真正等于"管理所有群"，就必须用一个<b>以码为令牌</b>的 URL 打开页面
+     * —— 那种页面走的是 admin 视图，服务端按 {@code scope = null} 返回全部群。
+     */
+    private String manageCodeText(String code) {
+        String link = recordWebAuth.link(code);
+        StringBuilder sb = new StringBuilder("【录播网页管理码】\n").append(code).append("\n\n");
+        if (link != null) {
+            sb.append("▶ 管理台（打开就是【全部群】的录播，能直接删 / 保留 / 实时预览）：\n")
+                    .append(link).append("\n\n");
+        } else {
+            sb.append("⚠️ 拼不出管理台链接（推断不出公网可达的基址）：让所有者配 ")
+                    .append(LoadDSConfig.KEY_BILI_RECORD_WEB_BASE_URL).append("。\n")
+                    .append("眼下只能：打开任一录播网页 → 右上角「管理」→ 粘贴上面这串码。\n\n");
+        }
+        sb.append("也可以：打开任一录播网页 → 点右上角「管理」→ 粘贴这串码（粘一次即可，存在浏览器本机）。\n")
+                .append("有了它就能在网页上改保留、删录播 —— 能看全部群，不只是某一个群。\n")
+                .append("⚠️ 这条链接和这串码等于<b>删除权</b>：别发到任何群里，也别存进共享文档。")
+                .append("泄了就发「录播管理码重置」，旧的一次全失效。");
+        return sb.toString();
     }
 
     // ================================================================== 命令：配置项表
@@ -1061,6 +1272,12 @@ public class LiveRecordPlugins {
                     "15",
                     "下载链接多久失效（只在走 url 交付时有意义）",
                     "有效期", "ttl", "linkttl"),
+            ConfItem.text("交付基址", LoadDSConfig.KEY_BILI_RECORD_PUBLIC_BASE_URL, URL_PATTERN,
+                    "自动推断",
+                    "NapCat 从哪个地址来取文件（录播下载的链接就用它开头）。不配则自动推断："
+                            + "先 docker 网桥地址、再取流出口网卡、最后才考虑 127.0.0.1。"
+                            + "⚠️ 配成公网域名会让 NapCat 绕一圈外网，除非它不在本机 —— 别拿它和「网页基址」搞混",
+                    "取文件基址", "文件基址", "publicbase", "filebase", "napcatbase"),
             ConfItem.num("链接次数", LoadDSConfig.KEY_BILI_RECORD_LINK_MAX_USES, "次", 1, 100,
                     "5",
                     "一条下载链接能用几次（防转发扩散）",
@@ -1403,6 +1620,29 @@ public class LiveRecordPlugins {
         try {
             long value = Long.parseLong(digits);
             return value > 0 ? value : null;
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /**
+     * 解析"群号令牌"：与 {@link #parseId} 只差一条 —— <b>0 是合法值</b>，表示"全局订阅那一行"
+     * （{@code group_id IS NULL}）。
+     *
+     * <p>为什么不干脆放宽 {@code parseId}：房间号、fid 那边 0 是非法值，
+     * 放宽了会让「录播下载 0」「录播开关 0 关」从"当场报格式错"变成
+     * "去查一条不存在的记录"，错误信息从"你打错了"退化成"没有这个东西"。
+     */
+    private static Long parseGroupToken(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        String digits = raw.trim().split("\\s+")[0].replaceAll("[^0-9]", "");
+        if (digits.isEmpty() || digits.length() > 15) {
+            return null;
+        }
+        try {
+            return Long.parseLong(digits);
         } catch (NumberFormatException e) {
             return null;
         }
