@@ -6,6 +6,7 @@ import com.esdllm.common.CmdPrefix;
 import com.esdllm.common.CookieUtils;
 import com.esdllm.config.LoadDSConfig;
 import com.esdllm.service.CredentialGuard;
+import com.esdllm.service.CredentialNotifier;
 import com.mikuac.shiro.annotation.AnyMessageHandler;
 import com.mikuac.shiro.annotation.MessageHandlerFilter;
 import com.mikuac.shiro.annotation.common.Shiro;
@@ -49,7 +50,7 @@ import java.util.regex.Pattern;
  * 开关                                           ← 列出所有功能开关
  * 开关 热评 开                                   ← 改一项（热评/主播/摘要/动态源/探测间隔/录播网页…）
  * 开关 探期间隔 12                                ← 数字项直接给值
- * 开关 录播网页基址 https://rec.example.com       ← 文本项直接给值（发「自动」可清空）
+ * 开关 录播网页基址 <a href="https://rec.example.com">...</a>       ← 文本项直接给值（发「自动」可清空）
  * </pre>
  *
  * <p><b>什么时候需要配代理</b>：Cookie 完全正确（日志里"出站身份"的键名齐全）却仍持续 412
@@ -713,6 +714,16 @@ public class BiliConfigPlugins {
                 "≤0 = 关闭兜底（只保留推送失败时的事件驱动探测）；不配则默认 "
                         + CredentialGuard.DEFAULT_CHECK_HOURS,
                 "探测", "间隔", "interval", "hours"),
+        CRED_ALERT("登录提醒", Kind.BOOL, LoadDSConfig.KEY_BILI_CREDENTIAL_ALERT,
+                "凭据失效 / 待更换时私聊提醒机器人所有者",
+                "只私聊所有者、不发群；没配也算开（这是「机器人悄悄不推了」的最后一道兜底）",
+                "提醒", "登录提醒", "alert"),
+        CRED_ALERT_HOURS("登录提醒间隔", Kind.INT, LoadDSConfig.KEY_BILI_CREDENTIAL_ALERT_INTERVAL_HOURS,
+                "同一结论最多多久提醒一次（小时）",
+                "≤0 = 同一结论只提醒一次；不配则默认 "
+                        + CredentialNotifier.DEFAULT_ALERT_INTERVAL_HOURS
+                        + "（结论变化时不受本间隔限制，立刻提醒）",
+                "提醒间隔", "提醒频率", "alertinterval"),
         // ⚠️ 录播这两项属于「要暴露本机文件 / 要人知道真实拓扑」的那一类，与换 Cookie、换出口同性质
         // ⇒ 走同一个入口（只认机器人所有者），也正好对应"让所有者配一个公网可达的域名或 IP"。
         RECORD_WEB("录播网页", Kind.BOOL, LoadDSConfig.KEY_BILI_RECORD_WEB_ENABLED,
@@ -792,8 +803,12 @@ public class BiliConfigPlugins {
          */
         String emptyHint() {
             return switch (kind) {
-                case BOOL -> "按关处理";
-                case INT -> "默认 " + CredentialGuard.DEFAULT_CHECK_HOURS;
+                // 「登录提醒」特殊：它的缺省是"开"（兜底提醒不该静默），
+                // 这里如实写出来，否则会显示成"未配置（按关处理）"，与真实行为相反。
+                case BOOL -> this == CRED_ALERT ? "默认开" : "按关处理";
+                case INT -> this == CRED_ALERT_HOURS
+                        ? "默认 " + CredentialNotifier.DEFAULT_ALERT_INTERVAL_HOURS
+                        : "默认 " + CredentialGuard.DEFAULT_CHECK_HOURS;
                 case SOURCE -> "按 auto 处理";
                 case TEXT -> this == RECORD_WEB_BASE ? "自动推断基址"
                         : this == BOT_NAMES ? "只认 OneBot 给的昵称 / 群名片 / QQ 号"

@@ -104,6 +104,42 @@ public class LoadDSConfig {
     public static final String KEY_BILI_CREDENTIAL_CHECK_HOURS = "biliCredentialCheckHours";
 
     /**
+     * 配置键：B 站凭据异常时<b>私聊提醒机器人所有者</b>。取值 {@code true/1/on/yes} 才开；
+     * <b>没配也算开</b>（有意为之：这是"机器人悄悄不推了"的最后一道兜底，默认不该是静默）。
+     *
+     * <p><b>为什么要主动推</b>：凭据失效/待更换原本只体现在两处 —— 日志里一行 WARN，
+     * 以及用户主动发「登录状态」才看得到。可"机器人不推动态了"这件事，用户的第一反应是
+     * 怀疑网络、怀疑 B 站、怀疑订阅，<b>几乎不会想到是 Cookie 过期</b>；
+     * 等他自己去查，可能已经漏推了几天。
+     *
+     * <p><b>推什么</b>（两种情况都推）：
+     * <ul>
+     *   <li>{@code INVALID}：服务端明确不认这枚凭据 ⇒ 推送已经在静默失败；</li>
+     *   <li>{@code VALID} 但服务端答"该刷新了"：现在还能用，<b>但随时会失效</b> ——
+     *       本库不实现刷新（web 端那套换 Cookie 是 iframe + WASM），所以它的含义就是"该重新登录"。
+     *       这种情况最值得提前提醒：此时登录还是好的，重扫一次成本最低。</li>
+     * </ul>
+     *
+     * <p><b>防刷屏</b>：同一结论不重复推，最小间隔见
+     * {@link #KEY_BILI_CREDENTIAL_ALERT_INTERVAL_HOURS}；结论变化（失效 / 待更换 / 恢复正常）
+     * 会立刻推一次。
+     *
+     * <p>改动即时生效，不需要重启。
+     */
+    public static final String KEY_BILI_CREDENTIAL_ALERT = "biliCredentialAlert";
+
+    /**
+     * 配置键：同一个凭据结论<b>最多多久提醒一次</b>（小时），默认 <b>12</b>；<b>≤0 表示只提醒一次</b>。
+     *
+     * <p>为什么还要"重复提醒"而不是只报一次：凭据问题没人修就一直坏着，
+     * 只报一次的话很容易被后续消息刷走、彻底忘掉。而重复频率又不能高 ——
+     * 这条提醒本身是私聊消息，属于"打扰"，12 小时是"一天最多两次"的量级。
+     *
+     * <p>结论发生变化时<b>不受本间隔限制</b>，立刻提醒（见 {@link com.esdllm.service.CredentialNotifier}）。
+     */
+    public static final String KEY_BILI_CREDENTIAL_ALERT_INTERVAL_HOURS = "biliCredentialAlertHours";
+
+    /**
      * 配置键：视频链接解析是否<b>附带热评</b>。取值 {@code true/1/on/yes} 才开，<b>默认关</b>。
      *
      * <p><b>为什么默认关</b>：热评不在 {@code view/detail} 的响应里（该响应的 {@code reply}
@@ -1036,6 +1072,11 @@ public class LoadDSConfig {
             // 间隔由 CredentialGuard 每次兜底检查时读取（与 biliDynamicSource 同一范式），
             // 这里只回显一次，方便确认"改对了、立即生效了"。
             log.info("B 站凭据兜底探测间隔已改为 {} 小时（0 或负数 = 关闭兜底，只保留推送失败时的事件驱动探测）",
+                    configMap.get(key));
+        } else if (KEY_BILI_CREDENTIAL_ALERT.equals(key)) {
+            log.info("B 站凭据异常私聊提醒已{}（异常时私聊机器人所有者，不打扰群）", isEnabled(key, true) ? "开启" : "关闭");
+        } else if (KEY_BILI_CREDENTIAL_ALERT_INTERVAL_HOURS.equals(key)) {
+            log.info("B 站凭据提醒的最小间隔已改为 {} 小时（0 或负数 = 同一结论只提醒一次）",
                     configMap.get(key));
         } else if (KEY_BILI_ANALYSIS_WITH_COMMENTS.equals(key)) {
             log.info("视频解析附带热评已{}（开启后单次解析的 B 站请求数 1 → 2）",

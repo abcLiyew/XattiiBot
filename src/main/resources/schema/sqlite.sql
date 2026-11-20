@@ -288,3 +288,47 @@ CREATE INDEX IF NOT EXISTS idx_live_record_file_room_status
 
 CREATE INDEX IF NOT EXISTS idx_live_record_file_start_time
     ON live_record_file (start_time);
+
+-- ============================================================================
+-- 索引（2026-11-20 补第二轮）
+--
+-- 上一轮（2026-10-03）按当时的查询形状建了 9 条；这一轮补的是这期间新增功能带进来的
+-- 两类形状：「按群 + 某房间」的点查，和「按房间 + 时间序」的分页。
+-- 依旧不靠感觉，逐条用 EXPLAIN QUERY PLAN 在临时库里比对过（探针见 temp/probe_index_plan.py，
+-- 它按 MyBatis-Plus 真正下发的语句形状跑，包括自动追加的 is_delete = 0）。
+--
+--   idx_push_info_group_room  (group_id, room_id)
+--       服务三处「本群 + 某房间」的点查，条件恒以 group_id 打头：
+--         PushInfoServiceImpl#setLivePushAtAll / #setLivePushAtMe → group_id = ? AND room_id = ?（count + update）
+--         PushInfoServiceImpl#listRoomOptions                    → group_id = ?（「开播@全体」不带房间号时列房间）
+--       实测（EXPLAIN QUERY PLAN）：
+--         · listRoomOptions 加之前是 SCAN push_info，加之后 SEARCH ... USING INDEX (group_id=?)；
+--         · 那两处「本群 + 某房间」原来只能蹭 idx_push_info_room_qq_uid_group 的 room_id 前缀，
+--           拿到房间的全部订阅行（每个群一行）再回表筛 group_id —— 现在是两列同时命中，回表次数按群数降。
+--       不再单独加只含 group_id 的索引 —— 等值条件打头，单列查询直接吃这条的最左前缀，
+--       多一条只是多一份要维护的结构。
+--
+--   idx_live_record_file_room_start  (room_id, start_time)
+--       服务录播列表/计数：room_id = ?（或多房间 IN）之后按 start_time 排序分页 ——
+--         LiveRecordServiceImpl#listFiles / #countFiles / #listFilesOfRooms / #usedBytesOfRooms
+--       ⚠️ 原有的 idx_live_record_file_room_status 领列同样是 room_id，但第二列是 status，
+--       排序蹭不上它 ⇒ 单房间分页要多付一次 TEMP B-TREE。换成 (room_id, start_time) 后
+--       单房间那条变成"顺着索引顺序走、天然有序"，多房间 IN 那条仍要排序（IN 的固有代价），
+--       但扫描范围从"整表"降到"这几间房的行"。
+--       ⚠️ 两条 (room_id, ...) 索引必须都留着，谁也替代不了谁：
+--       一条服务"这个房间此刻在不在录"（room_id + status），一条服务"这个房间的历史产物"（room_id + start_time）。
+--       写入代价可忽略 —— 这张表一场录播才写几行，热的是读。
+--
+-- 以下三处**刻意不加**（也验过，别以后又"优化"回来）：
+--   · live_record_sub (auto_record)：开播检测 tick 本来就要读**全部**订阅行，
+--     而 auto_record = 1 几乎命中所有行 ⇒ 走索引等于每行多一次回表，是形似而非真优化，保持全表扫。
+--   · admin (group_id)：botAdmins() 每条消息都要查一次 group_id IS NULL，但这张表只有几行，
+--     索引省不下一次页读取，只多一份维护成本。
+--   · config / live_record_sub 的「全量 selectList」：本来就要读全部行，索引救不了，别为它加。
+-- ============================================================================
+
+CREATE INDEX IF NOT EXISTS idx_push_info_group_room
+    ON push_info (group_id, room_id);
+
+CREATE INDEX IF NOT EXISTS idx_live_record_file_room_start
+    ON live_record_file (room_id, start_time);

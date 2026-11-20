@@ -104,8 +104,10 @@ XatiiBot 是一个基于 Java 开发的 QQ 机器人，主要用于解析和分�
 - SendGuardAspect ：发送熔断（出站）—— 一个 AOP 切面包住 shiro 全部发送方法的唯一汇入口
   `ActionHandler.action(..)`，按目标滑窗限频 + 重复内容熔断，零调用点改动
 - LiveRecordPlugins / LiveRecordServiceImpl ：「录播订阅 / 录播列表 / 录播下载 …」命令与
-  录制调度（开播自动起 ffmpeg、断流自查、容量压缩/清理）；RecordFileServer 是内置只读文件服务，
-  RecordWebController 提供录播网页
+  录制调度（开播自动起 ffmpeg、断流自查、容量压缩/清理）；另有总闸「录播 开/关」与参数面板
+  「录播配置」；RecordFileServer 是内置只读文件服务，RecordWebController 提供录播网页
+- HelpPlugins ：「help / 帮助 / 菜单」指令一览（**按发送者权限裁剪**，只列他能用的）与
+  「help 录播 / help 推送 / help 老婆 / help 配置」分模块详情
 - FfmpegProvider ：ffmpeg 运行时获取与探活（配置路径 → `./bin/ffmpeg` 缓存 → PATH →
   后台自动下载，原子落盘），录播与转码共用
 - PushInfoServiceImpl ：订阅的增删与推送逻辑，含管理员鉴权
@@ -252,7 +254,18 @@ ffmpeg 退出后 worker 会**再查一次开播状态**区分"网络抖动断流
 录播状态                     ← 正在录 / 容量 / ffmpeg 状态一览
 录播整理                     ← 立即跑一次容量管理（压缩→清理）
 录播网页                     ← 发一个带令牌的网页链接：本群订阅录播的浏览/播放/下载
+录播 开 / 录播 关            ← 总闸（仅所有者）：关着时一个 B 站请求都不发
+录播配置                     ← 全部参数一览；录播配置 硬水位 20480 改一项（仅所有者）
 ```
+
+`录播配置` 可改的项：总闸、检测间隔、单场上限（分钟）、并发、磁盘下限、压缩水位、硬水位、
+压缩高度、压缩质量（CRF）、压缩预设、画质（qn）、目录、交付方式、链接有效期与次数、
+网页开关、网页基址。**改完即时生效**；只有 `biliRecordServePort` / `biliRecordServeBind`
+（内置文件服务的端口与监听地址）需要重启，所以没放进面板。
+
+> 记不住命令就发 **`help`**（也接受「帮助」「菜单」「指令」「命令」）：它按你的身份
+> （群成员 / 群管理员 / 白名单 / 所有者）**只列出你真能用的命令**，
+> `help 录播` 这类还能看某一类的详细说明与坑。
 
 容量自管理（全局维度，`live_record_file` 汇总）：总量超 `biliRecordCompressTotalMb`（默认 15GB）
 先压缩老文件（降分辨率 + CRF，**只降不升**）；仍超 `biliRecordHardTotalMb`（默认 25GB）删最早的

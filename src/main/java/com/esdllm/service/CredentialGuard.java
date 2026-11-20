@@ -5,6 +5,7 @@ import com.esdllm.bilibiliApi.http.HttpPolicy;
 import com.esdllm.bilibiliApi.model.data.pojo.login.CredentialStatus;
 import com.esdllm.config.LoadDSConfig;
 import jakarta.annotation.Resource;
+import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
@@ -63,6 +64,15 @@ public class CredentialGuard {
     @Resource
     private LoadDSConfig loadDSConfig;
 
+    /**
+     * 凭据异常时的主动私聊提醒（见 {@link CredentialNotifier}）。
+     *
+     * <p>依赖方向是 <b>Guard → Notifier</b> 单向的：Notifier 只接收 {@link Status} 这个静态类型，
+     * 不反向依赖 Guard，所以不存在循环依赖。
+     */
+    @Resource
+    private CredentialNotifier credentialNotifier;
+
     /** 最近一次探测结果（含缓存复用），{@code null} 表示本次进程还没探过 */
     private volatile Status lastStatus = null;
 
@@ -85,6 +95,7 @@ public class CredentialGuard {
     }
 
     /** 触发探测的原因，只用于日志归因 */
+    @Getter
     public enum Reason {
         /** 动态推送失败后顺手探一次（事件驱动，常态零开销） */
         PUSH_FAILURE("推送失败"),
@@ -99,9 +110,6 @@ public class CredentialGuard {
             this.text = text;
         }
 
-        public String getText() {
-            return text;
-        }
     }
 
     /**
@@ -110,25 +118,58 @@ public class CredentialGuard {
      * <p>{@link #summary} 直接沿用库里的 {@code CredentialStatus#summary()}（它已经按"不含凭据值"的口径写过），
      * 失败时是异常消息 —— <b>两者都不含 Cookie 值</b>。
      */
+    @Getter
     public static final class Status {
 
         private final Verdict verdict;
+        /**
+         * -- GETTER --
+         * 一行摘要（不含凭据值），可直接进日志或消息回复
+         */
         private final String summary;
         private final long uid;
         private final String uname;
         private final int code;
-        /** 服务端有没有回答"该不该刷新"这一项；{@code false} 时下一项没有意义 */
+        /** 服务端有没有回答"该不该刷新"这一项；{@code false} 时下一项没有意义
+         * -- GETTER --
+         * 服务端有没有回答"该不该刷新"；
+         *  时
+         *  无意义
+         */
         private final boolean refreshChecked;
         /**
          * 服务端是否认为该换一枚新凭据了。
          *
          * <p>⚠️ 本库<b>没有实现刷新</b>（web 端那套换 Cookie 是浏览器内的 iframe + WASM 流程），
          * 所以这个 {@code true} 的当前含义就是"<b>请重新登录</b>"。
+         * -- GETTER --
+         * 服务端认为该换新凭据了 —— 本库不实现刷新，所以它的含义就是"请重新登录"
+
          */
         private final boolean refreshNeeded;
-        /** 上次真正问服务端的时刻（毫秒）；失败也会更新。{@code 0} 表示没探过 */
+        /** 上次真正问服务端的时刻（毫秒）；失败也会更新。{@code 0} 表示没探过
+         * -- GETTER --
+         * 上次真正问服务端的时刻（毫秒）；失败也会更新。
+         *  表示没探过
+         */
         private final long probedAt;
+        /**
+         * -- GETTER --
+         *  与<b>上一次探测</b>相比结论是否变了。
+         *  <p>告警去重就靠它：Cookie 一直失效时，每轮推送都会读到
+         * ，
+         *  但只有<b>第一次</b>（以及恢复那一次）值得刷日志。
+         *  <p>🔴 这个标记由
+         *  在<b>写入之前</b>比对得出再回填 ——
+         *  绝不能在构造时就写死
+         * ：那会让所有"状态变化"判断永远为假，
+         *  症状是"失效了但日志里一条告警都没有"（比报错难查得多）。
+         */
         private final boolean stateChanged;
+        /**
+         * -- GETTER --
+         * 本次结论是不是从缓存里取的（没发请求）
+         */
         private final boolean fromCache;
 
         private Status(Verdict verdict, String summary, long uid, String uname, int code,
@@ -168,61 +209,6 @@ public class CredentialGuard {
             return new Status(st.isLoggedIn() ? Verdict.VALID : Verdict.INVALID,
                     st.summary(), st.getUid(), st.getUname(), st.getCode(),
                     st.isRefreshChecked(), st.isRefreshNeeded(), probedAt, false, false);
-        }
-
-        public Verdict getVerdict() {
-            return verdict;
-        }
-
-        /** 一行摘要（不含凭据值），可直接进日志或消息回复 */
-        public String getSummary() {
-            return summary;
-        }
-
-        public long getUid() {
-            return uid;
-        }
-
-        public String getUname() {
-            return uname;
-        }
-
-        public int getCode() {
-            return code;
-        }
-
-        /** 服务端有没有回答"该不该刷新"；{@code false} 时 {@link #isRefreshNeeded()} 无意义 */
-        public boolean isRefreshChecked() {
-            return refreshChecked;
-        }
-
-        /** 服务端认为该换新凭据了 —— 本库不实现刷新，所以它的含义就是"请重新登录" */
-        public boolean isRefreshNeeded() {
-            return refreshNeeded;
-        }
-
-        /** 上次真正问服务端的时刻（毫秒）；失败也会更新。{@code 0} 表示没探过 */
-        public long getProbedAt() {
-            return probedAt;
-        }
-
-        /**
-         * 与<b>上一次探测</b>相比结论是否变了。
-         *
-         * <p>告警去重就靠它：Cookie 一直失效时，每轮推送都会读到 {@code INVALID}，
-         * 但只有<b>第一次</b>（以及恢复那一次）值得刷日志。
-         *
-         * <p>🔴 这个标记由 {@link CredentialGuard#remember} 在<b>写入之前</b>比对得出再回填 ——
-         * 绝不能在构造时就写死 {@code false}：那会让所有"状态变化"判断永远为假，
-         * 症状是"失效了但日志里一条告警都没有"（比报错难查得多）。
-         */
-        public boolean isStateChanged() {
-            return stateChanged;
-        }
-
-        /** 本次结论是不是从缓存里取的（没发请求） */
-        public boolean isFromCache() {
-            return fromCache;
         }
 
         /** 明确"凭据废了"—— 这是唯一该提示用户重新登录的结论 */
@@ -361,6 +347,10 @@ public class CredentialGuard {
             //    false 的含义是"该重新登录"，异常的含义是"该重试"，两者处置相反。
             Status status = remember(Status.of(st, lastProbeAt));
             logProbe(status, reason);
+            // ★ 拿到服务端权威结论的这一刻，顺手把"该重新登录了"推到所有者私聊里 ——
+            //   否则这件事只存在于日志和用户主动查询里（用户几乎不会主动查）。
+            //   节流/去重/群聊不外发等规则都在 CredentialNotifier 内部，这里不重复判断。
+            credentialNotifier.onProbe(status, reason);
             return status;
         } catch (Throwable t) {
             // 探测失败 ≠ 凭据失效。这里绝不能返回 INVALID，否则一次网络抖动就会引导用户去重新登录。
